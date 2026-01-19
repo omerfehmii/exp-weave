@@ -1,0 +1,88 @@
+data:
+  path: data/yahoo_panel_big.npz
+  freq: hourly
+  L: 240
+  H: 24
+  quantiles:
+  - 0.1
+  - 0.5
+  - 0.9
+  target_dim: 1
+  past_feat_dim: 6
+  future_feat_dim: 6
+  train_frac: 0.7
+  val_frac: 0.15
+  step: 24
+  scale_x: true
+  min_past_obs: 24
+  min_future_obs: 6
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  mlp_hidden: 1024
+  dropout: 0.1
+patching:
+  scales:
+  - P: 6
+    S: 3
+    name: fine
+  - P: 24
+    S: 12
+    name: coarse
+  fusion: DUAL_SUM
+  dual_sum_weight: token
+  gate:
+    entropy_floor: 0.2
+    temperature: 1.0
+decoder:
+  mode: CA_ONLY
+  cats_masking:
+    enabled: true
+    p_min: 0.1
+    p_max: 0.7
+    scaling: NONE
+  dual_path:
+    enabled: false
+    uncertainty_cats: false
+head:
+  type: MONO
+  delta_floor: 0.0
+  lsq_s_min: 0.0
+missingness:
+  mask_embedding: true
+  dt_embedding: MLP_LOG1P
+  attn_logit_bias: HARD_NEG_INF
+calibration:
+  cqr:
+    enabled: true
+    rolling_window_days: 30
+    scope: PER_HORIZON
+training:
+  seed: 7
+  batch_size: 64
+  epochs: 20
+  device: mps
+  grad_clip: 1.0
+  output_path: artifacts/yahoo_big_fusion_dual_sum_token.pt
+  log_path: artifacts/yahoo_big_fusion_dual_sum_token_train_log.jsonl
+  log_every: 200
+  loss:
+    pinball_weight: 1.0
+    mae_weight: 0.0
+    quantile_weights:
+    - 1.0
+    - 1.0
+    - 1.0
+    width_min: 0.0
+    width_min_weight: 0.0
+    repulsion_weight: 0.0
+    repulsion_scale: 1.0
+  early_stopping:
+    enabled: true
+    patience: 2
+    min_delta: 0.001
+  optimizer:
+    name: adamw
+    lr: 0.001
+    weight_decay: 0.01

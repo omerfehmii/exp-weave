@@ -1,0 +1,5 @@
+h,move_mcc,move_auc,move_brier,dir_mcc,dir_auc,dir_brier,dir_acc,dir_ece,dir_f1,n
+1,nan,nan,nan,nan,nan,nan,0.45064172,0.37339574,nan,18700
+2,nan,nan,nan,nan,nan,nan,0.45165774,0.37360114,nan,18700
+3,nan,nan,nan,nan,nan,nan,0.44994652,0.3734374,nan,18700
+4,nan,nan,nan,nan,nan,nan,0.45315507,0.37360206,nan,18700

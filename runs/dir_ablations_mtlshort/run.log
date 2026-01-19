@@ -1,0 +1,66 @@
+=== mag (skip: already in summary) ===
+=== pcgrad_nomag (skip: already in summary) ===
+=== gradnorm_mag ===
+train: configs/ablations/yahoo_big_lsq_smin_0_p3_dirhead_mag_gradnorm_mtlshort.yaml
+train_samples=49687 val_samples=10599
+epoch=0 step=200 train_loss=0.0559 samples_per_s=37.8 lr=1.00e-03
+epoch=0 step=400 train_loss=0.0373 samples_per_s=38.0 lr=1.00e-03
+epoch=0 step=600 train_loss=0.0344 samples_per_s=11.3 lr=1.00e-03
+epoch=0 train_loss=0.0417 val_loss=0.0669 val_cov90=0.6837 val_width90=0.4558 epoch_time_s=2628.6
+val_dir_loss=0.7721
+epoch=1 step=977 train_loss=0.0344 samples_per_s=37.0 lr=1.00e-03
+epoch=1 step=1177 train_loss=0.0324 samples_per_s=32.1 lr=1.00e-03
+epoch=1 step=1377 train_loss=0.0322 samples_per_s=35.8 lr=1.00e-03
+epoch=1 train_loss=0.0323 val_loss=0.0205 val_cov90=0.7078 val_width90=0.1032 epoch_time_s=1442.5
+val_dir_loss=0.5239
+epoch=2 step=1754 train_loss=0.0304 samples_per_s=38.6 lr=1.00e-03
+epoch=2 step=1954 train_loss=0.0327 samples_per_s=38.6 lr=1.00e-03
+epoch=2 step=2154 train_loss=0.0301 samples_per_s=38.6 lr=1.00e-03
+epoch=2 train_loss=0.0311 val_loss=0.0149 val_cov90=0.6852 val_width90=0.1276 epoch_time_s=1332.2
+val_dir_loss=0.5134
+epoch=3 step=2531 train_loss=0.0303 samples_per_s=38.6 lr=1.00e-03
+epoch=3 step=2731 train_loss=0.0316 samples_per_s=38.5 lr=1.00e-03
+epoch=3 step=2931 train_loss=0.0304 samples_per_s=38.6 lr=1.00e-03
+epoch=3 train_loss=0.0308 val_loss=0.0165 val_cov90=0.8891 val_width90=0.1293 epoch_time_s=1333.3
+val_dir_loss=0.5250
+epoch=4 step=3308 train_loss=0.0303 samples_per_s=38.5 lr=1.00e-03
+epoch=4 step=3508 train_loss=0.0305 samples_per_s=38.4 lr=1.00e-03
+epoch=4 step=3708 train_loss=0.0313 samples_per_s=38.3 lr=1.00e-03
+epoch=4 train_loss=0.0307 val_loss=0.0196 val_cov90=0.8836 val_width90=0.1366 epoch_time_s=1338.6
+val_dir_loss=0.5216
+epoch=5 step=4085 train_loss=0.0317 samples_per_s=38.6 lr=1.00e-03
+epoch=5 step=4285 train_loss=0.0324 samples_per_s=38.7 lr=1.00e-03
+epoch=5 step=4485 train_loss=0.0328 samples_per_s=38.6 lr=1.00e-03
+epoch=5 train_loss=0.0324 val_loss=0.0282 val_cov90=0.9231 val_width90=0.3242 epoch_time_s=1569.5
+val_dir_loss=0.5320
+early_stop at epoch=5 best_epoch=2 best_val=0.5134
+eval (best): forecast
+/Users/omer/Desktop/ag/.venv/lib/python3.14/site-packages/numpy/lib/_nanfunctions_impl.py:1593: RuntimeWarning: All-NaN slice encountered
+  return fnb._ureduce(a,
+/Users/omer/Desktop/ag/interval_clamp.py:88: RuntimeWarning: Mean of empty slice
+  zero_frac = np.nanmean(zero_mask, axis=axis)
+{'mae': 0.056664351373910904, 'rmse': 0.10235661669651071, 'pinball': 0.016817418858408928, 'coverage90': 0.6779335509890532, 'width90': 0.14531965553760529, 'collapse': 0.7909741545962526, 'crossing': 0.0, 'mae_orig': 21.62464141845703, 'rmse_orig': 39.06204218481719, 'mae_orig_last': 89.40780639648438, 'rmse_orig_last': 356.6364899130486, 'mae_orig_seasonal': 51.05263137817383, 'rmse_orig_seasonal': 269.46848725778676, 'dir_acc_model': 0.5009337068160598, 'dir_acc_last': 0.00211312595213524, 'dir_acc_seasonal': 0.49773944665585534, 'coverage80': 0.6779335509890532, 'width_zero_rate_mean': 0.0, 'width_p95_mean': 0.25991636514663696, 'width_p99_mean': 0.6459592580795288, 'bimod_ratio_mean': 2.166311025619507, 'zero_rate_band_1_6': 0.0, 'zero_rate_band_7_12': 0.0, 'zero_rate_band_13_24': 0.0, 'bimod_ratio_band_1_6': 2.067614793777466, 'bimod_ratio_band_7_12': 2.0533952713012695, 'bimod_ratio_band_13_24': 2.8714022636413574, 'pred_sim': 0.7909741545962526, 'width_sim': 0.7556472443415982, 'half_zero_frac': 0.0, 'half_p50': 0.060960352420806885, 'half_p95': 0.1265140026807785, 'half_p95_over_p50': 2.0753488540649414, 'coverage90_min': 0.0, 'coverage_traj': nan}
+eval (best): aci
+aci_metrics {'mae': 0.056664351373910904, 'rmse': 0.10235661669651071, 'coverage90': 0.7936843037605286, 'width90': 0.17991824448108673, 'coverage_traj': nan, 'coverage90_min': 0.7816037535667419, 'alpha_target': 0.2}
+eval (best): direction head
+{'dirscore_wMCC': 0.5137837529182434, 'dirscore_wAUC': 0.8641731142997742, 'dir_mcc_mean': 0.48486611247062683, 'dir_auc_mean': 0.8378114700317383, 'dir_brier_mean': 0.141719788312912, 'dir_acc_mean': 0.7438991069793701, 'dir_ece_mean': 0.03604210913181305, 'move_mcc_mean': 0.08656541258096695, 'move_auc_mean': 0.8741795420646667, 'move_brier_mean': 0.12508884072303772, 'dir_tp_sum': 19079, 'dir_tn_sum': 26852, 'dir_fp_sum': 6390, 'dir_fn_sum': 9042, 'delta_mode': 'origin', 'delta_quantile': 0.33, 'horizons': [1, 2, 3, 4, 5, 6, 7, 24]}
+eval (best): bootstrap ci
+/Users/omer/Desktop/ag/.venv/lib/python3.14/site-packages/numpy/lib/_nanfunctions_impl.py:1396: RuntimeWarning: All-NaN slice encountered
+  return _nanquantile_unchecked(
+{'horizons': [1, 2, 3, 4, 5, 6, 7, 24], 'metrics': ['acc', 'mcc'], 'bootstrap_runs': 200}
+eval (last): forecast
+/Users/omer/Desktop/ag/.venv/lib/python3.14/site-packages/numpy/lib/_nanfunctions_impl.py:1593: RuntimeWarning: All-NaN slice encountered
+  return fnb._ureduce(a,
+/Users/omer/Desktop/ag/interval_clamp.py:88: RuntimeWarning: Mean of empty slice
+  zero_frac = np.nanmean(zero_mask, axis=axis)
+{'mae': 0.09980960935354233, 'rmse': 0.2205400117352843, 'pinball': 0.03140033036470413, 'coverage90': 0.9518779664737029, 'width90': 0.41447967290878296, 'collapse': 0.33465643076078644, 'crossing': 0.0, 'mae_orig': 38.09003448486328, 'rmse_orig': 84.16400702274696, 'mae_orig_last': 89.40780639648438, 'rmse_orig_last': 356.6364899130486, 'mae_orig_seasonal': 51.05263137817383, 'rmse_orig_seasonal': 269.46848725778676, 'dir_acc_model': 0.4965108850557767, 'dir_acc_last': 0.00211312595213524, 'dir_acc_seasonal': 0.49773944665585534, 'coverage80': 0.9518779664737029, 'width_zero_rate_mean': 0.0, 'width_p95_mean': 1.0732096433639526, 'width_p99_mean': 3.1928348541259766, 'bimod_ratio_mean': 3.957514762878418, 'zero_rate_band_1_6': 0.0, 'zero_rate_band_7_12': 0.0, 'zero_rate_band_13_24': 0.0, 'bimod_ratio_band_1_6': 3.9642598628997803, 'bimod_ratio_band_7_12': 2.5188801288604736, 'bimod_ratio_band_13_24': 5.355679988861084, 'pred_sim': 0.33465643076078644, 'width_sim': 0.5347050314486781, 'half_zero_frac': 0.0, 'half_p50': 0.13738195598125458, 'half_p95': 0.5356436967849731, 'half_p95_over_p50': 3.898937702178955, 'coverage90_min': 0.0, 'coverage_traj': nan}
+eval (last): aci
+aci_metrics {'mae': 0.09980960935354233, 'rmse': 0.2205400117352843, 'coverage90': 0.7972784042358398, 'width90': 0.2868187725543976, 'coverage_traj': nan, 'coverage90_min': 0.7831131815910339, 'alpha_target': 0.2}
+eval (last): direction head
+/Users/omer/Desktop/ag/scripts/direction_head_eval.py:390: RuntimeWarning: Mean of empty slice
+  "move_mcc_mean": float(np.nanmean(move_mcc[h_idx])),
+{'dirscore_wMCC': 0.5408274531364441, 'dirscore_wAUC': 0.8749457597732544, 'dir_mcc_mean': 0.5119307041168213, 'dir_auc_mean': 0.8490140438079834, 'dir_brier_mean': 0.13691364228725433, 'dir_acc_mean': 0.7567371726036072, 'dir_ece_mean': 0.04947049170732498, 'move_mcc_mean': nan, 'move_auc_mean': 0.8689020872116089, 'move_brier_mean': 0.12798231840133667, 'dir_tp_sum': 19868, 'dir_tn_sum': 26768, 'dir_fp_sum': 6474, 'dir_fn_sum': 8253, 'delta_mode': 'origin', 'delta_quantile': 0.33, 'horizons': [1, 2, 3, 4, 5, 6, 7, 24]}
+eval (last): bootstrap ci
+/Users/omer/Desktop/ag/.venv/lib/python3.14/site-packages/numpy/lib/_nanfunctions_impl.py:1396: RuntimeWarning: All-NaN slice encountered
+  return _nanquantile_unchecked(
+{'horizons': [1, 2, 3, 4, 5, 6, 7, 24], 'metrics': ['acc', 'mcc'], 'bootstrap_runs': 200}

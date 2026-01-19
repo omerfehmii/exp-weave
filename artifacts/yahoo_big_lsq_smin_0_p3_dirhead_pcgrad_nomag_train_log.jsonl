@@ -1,0 +1,12 @@
+{"time": 1768778084.612363, "epoch": 0, "step": 200, "split": "train", "loss": 0.0774537514988333, "samples_per_s": 70.80049275962043, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768778263.766863, "epoch": 0, "step": 400, "split": "train", "loss": 0.05076338364742696, "samples_per_s": 71.44718569977672, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768778447.079956, "epoch": 0, "step": 600, "split": "train", "loss": 0.043378689410164956, "samples_per_s": 69.82631313213633, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768778670.866529, "epoch": 0, "step": 777, "split": "val", "loss": 0.01641757710814386, "epoch_time_s": 767.0443542003632, "coverage90": 0.9096312844250576, "width90": 0.17521360772381345, "dir_loss": 1.4892842511096633}
+{"time": 1768778848.152582, "epoch": 1, "step": 977, "split": "train", "loss": 0.041185462204739454, "samples_per_s": 72.22821604195896, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768779017.324097, "epoch": 1, "step": 1177, "split": "train", "loss": 0.040680974358692765, "samples_per_s": 75.66308742081527, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768779202.4330182, "epoch": 1, "step": 1377, "split": "train", "loss": 0.045518853981047866, "samples_per_s": 69.14879128840724, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768779401.738646, "epoch": 1, "step": 1554, "split": "val", "loss": 0.023221471369356275, "epoch_time_s": 730.8025982379913, "coverage90": 0.6596471760842769, "width90": 0.1724525542862444, "dir_loss": 1.485300445413015}
+{"time": 1768779675.751254, "epoch": 2, "step": 1754, "split": "train", "loss": 0.25678504914045336, "samples_per_s": 46.713352566407885, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768779956.574018, "epoch": 2, "step": 1954, "split": "train", "loss": 0.17037657264620065, "samples_per_s": 45.5806253823697, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768780216.791723, "epoch": 2, "step": 2154, "split": "train", "loss": 0.1262774021178484, "samples_per_s": 49.18978409806022, "lr": 0.001, "mt_w_main": null, "mt_w_dir": null}
+{"time": 1768780492.530381, "epoch": 2, "step": 2331, "split": "val", "loss": 0.02522784590732351, "epoch_time_s": 1090.791465997696, "coverage90": 0.518268239701234, "width90": 0.09606519438528333, "dir_loss": 1.1223896389984223}

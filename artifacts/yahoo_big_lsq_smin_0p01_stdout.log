@@ -1,0 +1,14 @@
+train_samples=49787 val_samples=10699
+epoch=0 step=200 train_loss=0.0758 samples_per_s=84.1 lr=1.00e-03
+epoch=0 step=400 train_loss=0.0526 samples_per_s=84.1 lr=1.00e-03
+epoch=0 step=600 train_loss=0.0429 samples_per_s=84.2 lr=1.00e-03
+epoch=0 train_loss=0.0540 val_loss=0.0125 val_cov90=0.9694 val_width90=0.1889 epoch_time_s=635.8
+epoch=1 step=978 train_loss=0.0399 samples_per_s=84.2 lr=1.00e-03
+epoch=1 step=1178 train_loss=0.0410 samples_per_s=84.2 lr=1.00e-03
+epoch=1 step=1378 train_loss=0.0412 samples_per_s=84.2 lr=1.00e-03
+epoch=1 train_loss=0.0407 val_loss=0.0186 val_cov90=0.8121 val_width90=0.1419 epoch_time_s=635.2
+epoch=2 step=1756 train_loss=0.0388 samples_per_s=84.2 lr=1.00e-03
+epoch=2 step=1956 train_loss=0.0804 samples_per_s=84.2 lr=1.00e-03
+epoch=2 step=2156 train_loss=0.0463 samples_per_s=84.1 lr=1.00e-03
+epoch=2 train_loss=0.0517 val_loss=0.0135 val_cov90=0.7393 val_width90=0.0984 epoch_time_s=635.5
+early_stop at epoch=2 best_epoch=0 best_val=0.0125
