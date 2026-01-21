@@ -9,3 +9,4 @@ data/
 *.npz
 *.log
 *.err
+configs/ablations/sweep/*
