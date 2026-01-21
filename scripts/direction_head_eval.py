@@ -84,6 +84,7 @@ def _parse_ints(raw: str) -> list[int]:
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -20.0, 20.0)
     return 1.0 / (1.0 + np.exp(-x))
 
 
@@ -118,6 +119,8 @@ def main() -> None:
     parser.add_argument("--split_purge", type=int, default=None)
     parser.add_argument("--split_embargo", type=int, default=None)
     parser.add_argument("--horizons", default="")
+    parser.add_argument("--opt_threshold_split", default="")
+    parser.add_argument("--opt_threshold_steps", type=int, default=101)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -185,63 +188,137 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    move_logits_list = []
-    dir_logits_list = []
-    logits3_list = []
-    y_future_list = []
-    y_last_list = []
-    mask_list = []
-    sigma_list = []
-    with torch.no_grad():
-        for batch, target in loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            target = target.to(device)
-            q_hat, extras = model(batch)
-            if "dir_logits3" in extras:
-                logits3_list.append(extras["dir_logits3"].cpu().numpy())
+    def collect_split_data(split_name: str) -> dict:
+        split_idx = select_indices_by_time(
+            indices,
+            split,
+            split_name,
+            horizon=horizon,
+            purge=split_purge,
+            embargo=split_embargo,
+        )
+        split_idx = filter_indices_with_observed(
+            series_list,
+            split_idx,
+            cfg["data"]["L"],
+            cfg["data"]["H"],
+            cfg["data"].get("min_past_obs", 1),
+            cfg["data"].get("min_future_obs", 1),
+        )
+        ds = WindowedDataset(series_list, split_idx, cfg["data"]["L"], cfg["data"]["H"])
+        loader = DataLoader(ds, batch_size=cfg["training"].get("batch_size", 64))
+
+        move_logits_list = []
+        dir_logits_list = []
+        logits3_list = []
+        y_future_list = []
+        y_last_list = []
+        mask_list = []
+        origin_mask_list = []
+        sigma_list = []
+        with torch.no_grad():
+            for batch, target in loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                target = target.to(device)
+                _, extras = model(batch)
+                if "dir_logits3" in extras:
+                    logits3_list.append(extras["dir_logits3"].cpu().numpy())
+                else:
+                    if "dir_move_logits" not in extras or "dir_dir_logits" not in extras:
+                        raise RuntimeError("direction head logits not found in model output.")
+                    move_logits_list.append(extras["dir_move_logits"].cpu().numpy())
+                    dir_logits_list.append(extras["dir_dir_logits"].cpu().numpy())
+                y_future_list.append(target[..., 0].cpu().numpy())
+                y_last_list.append(batch["y_past"][:, -1, 0].cpu().numpy())
+                mask_list.append(np.isfinite(target[..., 0].cpu().numpy()).astype(np.float32))
+                origin_mask_list.append(batch["mask"][:, -1, 0].cpu().numpy())
+                dir_cfg = cfg.get("training", {}).get("direction", {})
+                if dir_cfg.get("epsilon_mode", "quantile") == "vol":
+                    sigma = _compute_sigma_torch(batch["y_past"], batch["mask"], int(dir_cfg.get("epsilon_window", 24)))
+                    sigma_list.append(sigma.cpu().numpy())
+
+        use_three_class = len(logits3_list) > 0
+        if use_three_class:
+            logits3 = np.concatenate(logits3_list, axis=0)
+            move_prob = None
+            p_up = None
+        else:
+            logits3 = None
+            move_logits = np.concatenate(move_logits_list, axis=0)
+            dir_logits = np.concatenate(dir_logits_list, axis=0)
+            move_prob = _sigmoid(move_logits)
+            p_up = _sigmoid(dir_logits) * move_prob
+        y_future = np.concatenate(y_future_list, axis=0)
+        y_last = np.concatenate(y_last_list, axis=0)
+        mask = np.concatenate(mask_list, axis=0) > 0
+        origin_mask = np.concatenate(origin_mask_list, axis=0) > 0
+        mask = mask & origin_mask[:, None]
+
+        H = y_future.shape[1]
+        if args.delta_mode == "step":
+            ref = np.concatenate([y_last[:, None], y_future[:, :-1]], axis=1)
+        else:
+            ref = y_last[:, None]
+        delta = y_future - ref
+        dir_cfg = cfg.get("training", {}).get("direction", {})
+        epsilon_mode = dir_cfg.get("epsilon_mode", "quantile")
+        epsilon_k = float(dir_cfg.get("epsilon_k", 1.0))
+        if epsilon_mode == "vol":
+            if not sigma_list:
+                raise RuntimeError("epsilon_mode=vol but sigma not computed.")
+            sigma_arr = np.concatenate(sigma_list, axis=0).reshape(-1)
+            eps = epsilon_k * sigma_arr[:, None] * np.sqrt(np.arange(1, H + 1, dtype=np.float32))
+            move_label = (np.abs(delta) >= eps).astype(np.int32)
+        else:
+            eps = None
+            move_label = (np.abs(delta) >= tau_h).astype(np.int32)
+
+        if use_three_class:
+            probs = np.exp(logits3 - np.max(logits3, axis=2, keepdims=True))
+            probs = probs / np.sum(probs, axis=2, keepdims=True)
+            p_down = probs[:, :, 0]
+            p_flat = probs[:, :, 1]
+            p_up = probs[:, :, 2]
+            if epsilon_mode == "vol":
+                eps_h = eps
             else:
-                if "dir_move_logits" not in extras or "dir_dir_logits" not in extras:
-                    raise RuntimeError("direction head logits not found in model output.")
-                move_logits_list.append(extras["dir_move_logits"].cpu().numpy())
-                dir_logits_list.append(extras["dir_dir_logits"].cpu().numpy())
-            y_future_list.append(target[..., 0].cpu().numpy())
-            y_last_list.append(batch["y_past"][:, -1, 0].cpu().numpy())
-            mask_list.append(np.isfinite(target[..., 0].cpu().numpy()).astype(np.float32))
-            dir_cfg = cfg.get("training", {}).get("direction", {})
-            if dir_cfg.get("epsilon_mode", "quantile") == "vol":
-                sigma = _compute_sigma_torch(batch["y_past"], batch["mask"], int(dir_cfg.get("epsilon_window", 24)))
-                sigma_list.append(sigma.cpu().numpy())
+                eps_h = tau_h[None, :]
+            dir_label = (delta >= eps_h).astype(np.int32)
+            dir_mask = mask & (np.abs(delta) >= eps_h)
+            dir_prob = p_up / np.maximum(p_up + p_down, 1e-6)
+            move_prob = 1.0 - p_flat
+        else:
+            dir_label = (delta > 0).astype(np.int32)
+            dir_mask = mask & (move_label > 0)
+            dir_prob = p_up / np.maximum(move_prob, 1e-6)
 
-    use_three_class = len(logits3_list) > 0
-    if use_three_class:
-        logits3 = np.concatenate(logits3_list, axis=0)
-    else:
-        move_logits = np.concatenate(move_logits_list, axis=0)
-        dir_logits = np.concatenate(dir_logits_list, axis=0)
-        move_prob = _sigmoid(move_logits)
-        p_up = _sigmoid(dir_logits) * move_prob
-    y_future = np.concatenate(y_future_list, axis=0)
-    y_last = np.concatenate(y_last_list, axis=0)
-    mask = np.concatenate(mask_list, axis=0)
+        return {
+            "use_three_class": use_three_class,
+            "logits3": logits3,
+            "move_prob": move_prob,
+            "move_label": move_label,
+            "dir_prob": dir_prob,
+            "dir_label": dir_label,
+            "dir_mask": dir_mask,
+            "mask": mask,
+            "delta": delta,
+            "eps": eps,
+            "epsilon_mode": epsilon_mode,
+        }
 
-    H = y_future.shape[1]
-    if args.delta_mode == "step":
-        ref = np.concatenate([y_last[:, None], y_future[:, :-1]], axis=1)
-    else:
-        ref = y_last[:, None]
-    delta = y_future - ref
-    dir_cfg = cfg.get("training", {}).get("direction", {})
-    epsilon_mode = dir_cfg.get("epsilon_mode", "quantile")
-    epsilon_k = float(dir_cfg.get("epsilon_k", 1.0))
-    if epsilon_mode == "vol":
-        if not sigma_list:
-            raise RuntimeError("epsilon_mode=vol but sigma not computed.")
-        sigma_arr = np.concatenate(sigma_list, axis=0).reshape(-1)
-        eps = epsilon_k * sigma_arr[:, None] * np.sqrt(np.arange(1, H + 1, dtype=np.float32))
-        move_label = (np.abs(delta) >= eps).astype(np.int32)
-    else:
-        move_label = (np.abs(delta) >= tau_h).astype(np.int32)
-    dir_label = (delta > 0).astype(np.int32)
+    data = collect_split_data(args.split)
+    use_three_class = data["use_three_class"]
+    logits3 = data["logits3"]
+    move_prob = data["move_prob"]
+    move_label = data["move_label"]
+    dir_prob_full = data["dir_prob"]
+    dir_label_full = data["dir_label"]
+    dir_mask_full = data["dir_mask"]
+    mask = data["mask"]
+    delta = data["delta"]
+    eps = data["eps"]
+    epsilon_mode = data["epsilon_mode"]
+    H = delta.shape[1]
     rows = []
     move_mcc = np.full(H, np.nan, dtype=np.float32)
     move_auc = np.full(H, np.nan, dtype=np.float32)
@@ -258,7 +335,7 @@ def main() -> None:
     dir_fn = np.full(H, np.nan, dtype=np.float32)
 
     for h in range(H):
-        m = mask[:, h] > 0
+        m = mask[:, h]
         if not np.any(m):
             rows.append([h + 1, "nan", "nan", "nan", "nan", "nan", "nan", "nan", "nan", "nan", "nan", "nan", "nan", "nan", 0])
             continue
@@ -297,10 +374,10 @@ def main() -> None:
             move_auc[h] = _roc_auc(move_y, move_p)
             move_brier[h] = float(np.mean((move_p - move_y) ** 2))
 
-            dir_mask = m & (move_label[:, h] > 0)
+            dir_mask = dir_mask_full[:, h]
             if np.any(dir_mask):
-                dir_y = dir_label[dir_mask, h]
-                dir_p = p_up[dir_mask, h] / np.maximum(move_prob[dir_mask, h], 1e-6)
+                dir_y = dir_label_full[dir_mask, h]
+                dir_p = dir_prob_full[dir_mask, h]
                 dir_pred = (dir_p >= 0.5).astype(int)
                 tp, tn, fp, fn = _confusion(dir_y, dir_pred)
                 dir_mcc[h] = _mcc(dir_y, dir_pred)
@@ -338,6 +415,42 @@ def main() -> None:
     else:
         h_list = list(range(1, H + 1))
     h_idx = np.asarray([h - 1 for h in h_list], dtype=np.int64)
+
+    opt_thresholds = np.full(H, 0.5, dtype=np.float32)
+    dir_mcc_opt = np.full(H, np.nan, dtype=np.float32)
+    opt_split = args.opt_threshold_split.strip()
+    if opt_split:
+        opt_data = collect_split_data(opt_split)
+        opt_dir_prob = opt_data["dir_prob"]
+        opt_dir_label = opt_data["dir_label"]
+        opt_dir_mask = opt_data["dir_mask"]
+        steps = max(int(args.opt_threshold_steps), 3)
+        grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
+        for h in range(H):
+            m = opt_dir_mask[:, h]
+            if not np.any(m):
+                continue
+            y = opt_dir_label[m, h]
+            p = opt_dir_prob[m, h]
+            best_mcc = float("-inf")
+            best_thr = 0.5
+            for thr in grid:
+                pred = (p >= thr).astype(int)
+                score = _mcc(y, pred)
+                if np.isnan(score):
+                    continue
+                if score > best_mcc or (score == best_mcc and abs(thr - 0.5) < abs(best_thr - 0.5)):
+                    best_mcc = score
+                    best_thr = float(thr)
+            opt_thresholds[h] = best_thr
+        for h in range(H):
+            m = dir_mask_full[:, h]
+            if not np.any(m):
+                continue
+            y = dir_label_full[m, h]
+            p = dir_prob_full[m, h]
+            pred = (p >= opt_thresholds[h]).astype(int)
+            dir_mcc_opt[h] = _mcc(y, pred)
     if use_three_class:
         # assume class order: 0=down, 1=flat, 2=up
         dir_acc_ud = np.full(H, np.nan, dtype=np.float32)
@@ -398,6 +511,13 @@ def main() -> None:
             "delta_quantile": args.delta_quantile,
             "horizons": h_list,
         }
+    if opt_split:
+        valid_opt = ~np.isnan(dir_mcc_opt[h_idx])
+        w_mcc_opt = float(np.sum(dir_mcc_opt[h_idx][valid_opt] * weights[h_idx][valid_opt]) / max(np.sum(weights[h_idx][valid_opt]), 1e-6))
+        metrics["dirscore_wMCC_opt"] = w_mcc_opt
+        metrics["dir_mcc_opt_mean"] = float(np.nanmean(dir_mcc_opt[h_idx]))
+        metrics["opt_threshold_split"] = opt_split
+        metrics["opt_threshold_steps"] = steps
 
     out_csv = Path(args.out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -438,6 +558,8 @@ def main() -> None:
         dir_tn=dir_tn,
         dir_fp=dir_fp,
         dir_fn=dir_fn,
+        dir_mcc_opt=dir_mcc_opt,
+        opt_thresholds=opt_thresholds,
     )
     print(metrics)
 

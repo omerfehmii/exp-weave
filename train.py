@@ -139,6 +139,14 @@ def grad_norm(
     return torch.sqrt(torch.clamp(grad_norm_sq(grads, mask, device), min=0.0))
 
 
+def mcc_from_counts(tp: np.ndarray, tn: np.ndarray, fp: np.ndarray, fn: np.ndarray) -> np.ndarray:
+    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    out = np.full_like(denom, np.nan, dtype=np.float64)
+    valid = denom > 0
+    out[valid] = (tp[valid] * tn[valid] - fp[valid] * fn[valid]) / np.sqrt(denom[valid])
+    return out
+
+
 def project_conflicting(
     grads_a: List[torch.Tensor | None],
     grads_b: List[torch.Tensor | None],
@@ -395,6 +403,13 @@ def main() -> None:
     best_val = float("inf")
     best_state = None
     best_epoch = -1
+    best_val_loss = float("inf")
+    best_epoch_loss = -1
+    best_state_loss = None
+    best_val_dir = float("inf")
+    best_epoch_dir = -1
+    best_state_dir = None
+    best_dir_wmcc = float("-inf")
     bad_epochs = 0
 
     loss_cfg = cfg.get("training", {}).get("loss", {})
@@ -479,6 +494,8 @@ def main() -> None:
             q_hat, extras = model(batch)
             y_true = target[..., 0]
             mask = torch.isfinite(y_true).float()
+            origin_mask = batch["mask"][:, -1, 0]
+            mask_dir = mask * origin_mask[:, None]
             y_true = torch.nan_to_num(y_true, nan=0.0)
             main_loss = pinball_weight * masked_pinball_loss_torch(y_true, q_hat, quantiles, mask, quantile_weights)
             if mae_weight > 0:
@@ -508,7 +525,7 @@ def main() -> None:
                 else:
                     eps = tau_h_t
                 if dir_mag_weighting:
-                    mag_w = compute_magnitude_weights(delta, mask, dir_mag_power, dir_mag_min, dir_mag_max)
+                    mag_w = compute_magnitude_weights(delta, mask_dir, dir_mag_power, dir_mag_min, dir_mag_max)
                 else:
                     mag_w = torch.ones_like(delta)
                 if dir_type == "three_class":
@@ -519,7 +536,7 @@ def main() -> None:
                     up = delta >= eps
                     down = delta <= -eps
                     labels = torch.where(flat, torch.tensor(1, device=device), torch.where(up, torch.tensor(2, device=device), torch.tensor(0, device=device)))
-                    valid_mask = mask > 0
+                    valid_mask = mask_dir > 0
                     weights = dir_weights_t * valid_mask
                     if dir_mag_weighting:
                         weights = weights * mag_w
@@ -530,12 +547,12 @@ def main() -> None:
                 else:
                     if "dir_move_logits" not in extras or "dir_dir_logits" not in extras:
                         raise RuntimeError("direction head enabled but logits missing.")
-                    move_label = (torch.abs(delta) >= eps) & (mask > 0)
-                    dir_label = (delta > 0) & (mask > 0)
+                    move_label = (torch.abs(delta) >= eps) & (mask_dir > 0)
+                    dir_label = (delta > 0) & (mask_dir > 0)
                     move_logits = extras["dir_move_logits"]
                     dir_logits = extras["dir_dir_logits"]
                     bce = torch.nn.functional.binary_cross_entropy_with_logits
-                    move_mask = mask * dir_weights_t
+                    move_mask = mask_dir * dir_weights_t
                     if dir_mag_weighting:
                         move_mask = move_mask * mag_w
                     move_loss_raw = bce(move_logits, move_label.float(), reduction="none")
@@ -674,6 +691,15 @@ def main() -> None:
         val_width = 0.0
         cov_batches = 0
         dir_batches = 0
+        dir_tp = None
+        dir_tn = None
+        dir_fp = None
+        dir_fn = None
+        if dir_enabled and dir_type != "three_class":
+            dir_tp = torch.zeros(cfg["data"]["H"], device=device)
+            dir_tn = torch.zeros(cfg["data"]["H"], device=device)
+            dir_fp = torch.zeros(cfg["data"]["H"], device=device)
+            dir_fn = torch.zeros(cfg["data"]["H"], device=device)
         with torch.no_grad():
             for batch, target in val_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -749,6 +775,13 @@ def main() -> None:
                         else:
                             dir_loss = torch.tensor(0.0, device=device)
                         dir_loss = dir_move_weight * move_loss + dir_dir_weight * dir_loss
+                        if dir_tp is not None:
+                            dir_pred = torch.sigmoid(dir_logits) >= 0.5
+                            move_mask = move_label & (mask > 0)
+                            dir_tp += torch.sum(move_mask & dir_label & dir_pred, dim=0)
+                            dir_tn += torch.sum(move_mask & (~dir_label) & (~dir_pred), dim=0)
+                            dir_fp += torch.sum(move_mask & (~dir_label) & dir_pred, dim=0)
+                            dir_fn += torch.sum(move_mask & dir_label & (~dir_pred), dim=0)
                     val_dir_loss += dir_loss.item()
                     dir_batches += 1
                 if q10_idx is not None and q90_idx is not None:
@@ -760,6 +793,17 @@ def main() -> None:
         val_loss = val_loss / max(len(val_loader), 1)
         if dir_batches > 0:
             val_dir_loss = val_dir_loss / dir_batches
+        val_dir_wmcc = None
+        if dir_tp is not None:
+            tp = dir_tp.detach().cpu().numpy()
+            tn = dir_tn.detach().cpu().numpy()
+            fp = dir_fp.detach().cpu().numpy()
+            fn = dir_fn.detach().cpu().numpy()
+            mcc = mcc_from_counts(tp, tn, fp, fn)
+            weights = default_horizon_weights(cfg["data"]["H"])
+            valid = np.isfinite(mcc)
+            if np.any(valid):
+                val_dir_wmcc = float(np.sum(mcc[valid] * weights[valid]) / max(np.sum(weights[valid]), 1e-6))
         epoch_time = time.time() - epoch_start
         if cov_batches > 0:
             val_cov /= cov_batches
@@ -776,6 +820,8 @@ def main() -> None:
             )
         if dir_batches > 0:
             print(f"val_dir_loss={val_dir_loss:.4f}")
+        if val_dir_wmcc is not None:
+            print(f"val_dir_wmcc={val_dir_wmcc:.4f}")
 
         if log_path is not None:
             record = {
@@ -791,6 +837,8 @@ def main() -> None:
                 record["width90"] = val_width
             if dir_batches > 0:
                 record["dir_loss"] = val_dir_loss
+            if val_dir_wmcc is not None:
+                record["dir_wmcc"] = val_dir_wmcc
             append_log(log_path, record)
 
         if early_metric == "auto":
@@ -802,6 +850,11 @@ def main() -> None:
                 early_score = val_loss
         elif early_metric == "direction":
             early_score = val_dir_loss
+        elif early_metric == "direction_mcc":
+            if val_dir_wmcc is not None and np.isfinite(val_dir_wmcc):
+                early_score = -val_dir_wmcc
+            else:
+                early_score = val_dir_loss
         elif early_metric == "pinball":
             early_score = val_loss
         else:
@@ -819,9 +872,28 @@ def main() -> None:
                     print(f"early_stop at epoch={epoch} best_epoch={best_epoch} best_val={best_val:.4f}")
                     break
 
+        if val_loss < best_val_loss - early_min_delta:
+            best_val_loss = val_loss
+            best_epoch_loss = epoch
+            best_state_loss = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if dir_batches > 0:
+            if val_dir_wmcc is not None and np.isfinite(val_dir_wmcc):
+                if val_dir_wmcc > best_dir_wmcc + 1e-9:
+                    best_dir_wmcc = val_dir_wmcc
+                    best_epoch_dir = epoch
+                    best_state_dir = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            elif val_dir_loss < best_val_dir - early_min_delta:
+                best_val_dir = val_dir_loss
+                best_epoch_dir = epoch
+                best_state_dir = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
     output_path = Path(cfg["training"].get("output_path", "model.pt"))
     save_last = bool(cfg["training"].get("save_last", False))
     output_path_last = cfg["training"].get("output_path_last")
+    output_path_best_loss = cfg["training"].get("output_path_best_loss")
+    output_path_best_dir = cfg["training"].get("output_path_best_dir")
+    save_best_loss = bool(cfg["training"].get("save_best_loss", False)) or output_path_best_loss is not None
+    save_best_dir = bool(cfg["training"].get("save_best_dir", False)) or output_path_best_dir is not None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     state = best_state if best_state is not None else model.state_dict()
     torch.save({"model_state": state, "config": cfg}, output_path)
@@ -833,6 +905,20 @@ def main() -> None:
         last_path.parent.mkdir(parents=True, exist_ok=True)
         last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         torch.save({"model_state": last_state, "config": cfg}, last_path)
+    if save_best_loss and best_state_loss is not None:
+        if output_path_best_loss:
+            loss_path = Path(output_path_best_loss)
+        else:
+            loss_path = output_path.with_name(output_path.stem + "_best_loss" + output_path.suffix)
+        loss_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state": best_state_loss, "config": cfg}, loss_path)
+    if save_best_dir and best_state_dir is not None:
+        if output_path_best_dir:
+            dir_path = Path(output_path_best_dir)
+        else:
+            dir_path = output_path.with_name(output_path.stem + "_best_dir" + output_path.suffix)
+        dir_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state": best_state_dir, "config": cfg}, dir_path)
 
 
 if __name__ == "__main__":

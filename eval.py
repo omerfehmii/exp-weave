@@ -105,7 +105,15 @@ def build_series_list(path: str, observed_only: bool = False) -> List[SeriesData
 
 def apply_scaling(series_list: List[SeriesData], split_end: int, scale_x: bool = True) -> FoldFitPreprocessor:
     y_train = np.concatenate([s.y[:split_end] for s in series_list], axis=0)
-    mask_train = np.concatenate([s.mask[:split_end] for s in series_list], axis=0)
+    mask_train = np.concatenate(
+        [
+            s.mask[:split_end]
+            if s.mask is not None
+            else np.ones_like(s.y[:split_end], dtype=np.float32)
+            for s in series_list
+        ],
+        axis=0,
+    )
     x_train = None
     if scale_x and all(s.x_past_feats is not None for s in series_list):
         x_train = np.concatenate([s.x_past_feats[:split_end] for s in series_list], axis=0)
