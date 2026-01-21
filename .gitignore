@@ -2,3 +2,10 @@
 .venv/
 __pycache__/
 *.pyc
+artifacts/
+runs/
+data/
+*.pt
+*.npz
+*.log
+*.err

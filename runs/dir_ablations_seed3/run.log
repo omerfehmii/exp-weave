@@ -1,2 +1,0 @@
-=== pcgrad_mag_s7 ===
-train: configs/ablations/seeds/yahoo_big_lsq_smin_0_p3_dirhead_pcgrad_mag_seed7.yaml
