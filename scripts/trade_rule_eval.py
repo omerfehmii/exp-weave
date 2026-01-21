@@ -164,6 +164,7 @@ def main() -> None:
     parser.add_argument("--score_mode", default="mean", choices=["mean", "prob_edge"])
     parser.add_argument("--horizons", default="")
     parser.add_argument("--return_mode", default="diff", choices=["diff", "pct", "log"])
+    parser.add_argument("--value_scale", default="orig", choices=["orig", "scaled"])
     parser.add_argument("--tau", type=float, default=0.60)
     parser.add_argument("--move_tau", type=float, default=0.0)
     parser.add_argument("--cost_fixed", type=float, default=0.0)
@@ -199,8 +200,15 @@ def main() -> None:
         cfg["data"].get("train_frac", 0.7),
         cfg["data"].get("val_frac", 0.15),
     )
-    apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    pre = apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    if args.value_scale == "orig":
+        y = pre.inverse_y(y)
+        q10 = pre.inverse_y(q10)
+        q50 = pre.inverse_y(q50)
+        q90 = pre.inverse_y(q90)
     y0, origin_mask = _origin_values(series_list, series_idx, origin_t)
+    if args.value_scale == "orig":
+        y0 = pre.inverse_y(y0)
 
     H = q50.shape[1]
     horizons = _parse_horizons(args.horizons, H)
