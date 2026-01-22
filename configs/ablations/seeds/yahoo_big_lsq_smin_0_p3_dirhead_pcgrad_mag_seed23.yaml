@@ -71,7 +71,7 @@ calibration:
 training:
   seed: 23
   batch_size: 64
-  epochs: 20
+  epochs: 8
   device: mps
   grad_clip: 1.0
   output_path: artifacts/seed_runs/yahoo_big_lsq_smin_0_p3_dirhead_pcgrad_mag_seed23.pt
@@ -105,9 +105,14 @@ training:
     shared_only: true
   early_stopping:
     enabled: true
-    patience: 2
+    patience: 5
     min_delta: 0.001
+    metric: direction
   optimizer:
     name: adamw
     lr: 0.001
     weight_decay: 0.01
+  output_path_best_loss: artifacts/seed_runs/yahoo_big_lsq_smin_0_p3_dirhead_pcgrad_mag_seed23_best_loss.pt
+  output_path_best_dir: artifacts/seed_runs/yahoo_big_lsq_smin_0_p3_dirhead_pcgrad_mag_seed23_best_dir.pt
+  output_path_last: artifacts/seed_runs/yahoo_big_lsq_smin_0_p3_dirhead_pcgrad_mag_seed23_last.pt
+  save_last: true

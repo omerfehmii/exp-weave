@@ -72,9 +72,9 @@ def _select_scores(
     p_plus: np.ndarray | None,
     p_minus: np.ndarray | None,
 ) -> np.ndarray:
-    if score_mode == "mean":
+    if score_mode in {"mean", "q50"}:
         return mu_r
-    if score_mode == "prob_edge":
+    if score_mode in {"prob_edge", "edge_prob"}:
         if p_plus is None or p_minus is None:
             raise ValueError("prob_edge requires p_plus/p_minus.")
         return p_plus - p_minus
@@ -103,9 +103,47 @@ def _assign_rank_sides(
     return sides
 
 
-def _compute_time_metrics(origin_t: np.ndarray, pnl: np.ndarray) -> Tuple[float, float, float, float]:
+def _assign_rank_buckets(
+    scores: np.ndarray,
+    times: np.ndarray,
+    valid_mask: np.ndarray,
+    topk: int,
+) -> np.ndarray:
+    buckets = np.zeros_like(scores, dtype=np.int8)
+    if topk <= 0:
+        return buckets
+    uniq = np.unique(times)
+    for t in uniq:
+        idx = np.where((times == t) & valid_mask)[0]
+        if idx.size < 2 * topk:
+            continue
+        order = np.argsort(scores[idx])
+        bottom = idx[order[:topk]]
+        top = idx[order[-topk:][::-1]]
+        if bottom.size:
+            buckets[bottom[0]] = 1
+            if bottom.size > 1:
+                buckets[bottom[1:]] = 2
+        if top.size:
+            buckets[top[0]] = 1
+            if top.size > 1:
+                buckets[top[1:]] = 2
+    return buckets
+
+
+def _compute_time_metrics(
+    origin_t: np.ndarray, pnl: np.ndarray, gross_exposure: np.ndarray | None = None
+) -> Tuple[float, float, float, float, float, float, float]:
     if origin_t.size == 0:
-        return float("nan"), float("nan"), float("nan"), float("nan")
+        return (
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+        )
     uniq, inv = np.unique(origin_t, return_inverse=True)
     pnl_time = np.zeros(uniq.shape[0], dtype=np.float64)
     np.add.at(pnl_time, inv, pnl.astype(np.float64))
@@ -115,7 +153,155 @@ def _compute_time_metrics(origin_t: np.ndarray, pnl: np.ndarray) -> Tuple[float,
     cum = np.cumsum(pnl_time)
     peak = np.maximum.accumulate(cum)
     max_dd = float(np.max(peak - cum)) if cum.size else float("nan")
-    return mean_t, std_t, sharpe_t, max_dd
+    mean_t_norm = float("nan")
+    std_t_norm = float("nan")
+    sharpe_t_norm = float("nan")
+    if gross_exposure is not None:
+        gross_time = np.zeros(uniq.shape[0], dtype=np.float64)
+        np.add.at(gross_time, inv, gross_exposure.astype(np.float64))
+        pnl_time_norm = np.zeros_like(pnl_time)
+        active = gross_time > 1e-12
+        pnl_time_norm[active] = pnl_time[active] / gross_time[active]
+        mean_t_norm = float(np.mean(pnl_time_norm))
+        std_t_norm = float(np.std(pnl_time_norm))
+        sharpe_t_norm = mean_t_norm / (std_t_norm + 1e-12)
+    return mean_t, std_t, sharpe_t, max_dd, mean_t_norm, std_t_norm, sharpe_t_norm
+
+
+def _apply_hold_and_flip(
+    side: np.ndarray,
+    valid: np.ndarray,
+    series_idx: np.ndarray,
+    time_key_hours: np.ndarray,
+    hold_min_hours: int,
+    flip_penalty: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if hold_min_hours <= 0 and flip_penalty <= 0.0:
+        return side, np.zeros_like(side, dtype=np.float32)
+    extra_cost = np.zeros_like(side, dtype=np.float32)
+    last_time: Dict[int, int] = {}
+    last_side: Dict[int, int] = {}
+    order = np.lexsort((time_key_hours, series_idx))
+    for idx in order:
+        if not valid[idx]:
+            continue
+        s_idx = int(series_idx[idx])
+        t = int(time_key_hours[idx])
+        if hold_min_hours > 0:
+            lt = last_time.get(s_idx)
+            if lt is not None and (t - lt) < hold_min_hours:
+                side[idx] = 0
+                continue
+        if side[idx] != 0:
+            ls = last_side.get(s_idx, 0)
+            if flip_penalty > 0.0 and ls != 0 and side[idx] != ls:
+                extra_cost[idx] = flip_penalty
+            last_time[s_idx] = t
+            last_side[s_idx] = int(side[idx])
+    return side, extra_cost
+
+
+def _normalize_rank_exposure(
+    size: np.ndarray,
+    side: np.ndarray,
+    valid: np.ndarray,
+    time_key: np.ndarray,
+    target_gross: float,
+) -> np.ndarray:
+    trade = (valid > 0) & (side != 0)
+    if not np.any(trade):
+        return size
+    out = size.copy()
+    times = time_key[trade]
+    uniq, inv = np.unique(times, return_inverse=True)
+    gross = np.zeros(len(uniq), dtype=np.float64)
+    np.add.at(gross, inv, np.abs(out[trade] * side[trade]))
+    scale = np.ones_like(gross)
+    scale[gross > 0] = target_gross / gross[gross > 0]
+    out[trade] = out[trade] * scale[inv]
+    return out
+
+
+def _time_delta_stats(time_key_hours: np.ndarray, valid: np.ndarray) -> Tuple[float, float, float]:
+    if not np.any(valid):
+        return float("nan"), float("nan"), float("nan")
+    uniq = np.unique(time_key_hours[valid])
+    if uniq.size < 2:
+        return float("nan"), float("nan"), float("nan")
+    diffs = np.diff(np.sort(uniq)).astype(np.float64)
+    return float(np.min(diffs)), float(np.median(diffs)), float(np.max(diffs))
+
+
+def _weight_matrix(
+    weights: np.ndarray,
+    series_idx: np.ndarray,
+    time_key_hours: np.ndarray,
+    valid: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    mask = valid > 0
+    if not np.any(mask):
+        return np.zeros((0, 0), dtype=np.float32), np.zeros(0, dtype=np.int64)
+    times = time_key_hours[mask]
+    uniq_times, inv = np.unique(times, return_inverse=True)
+    n_times = uniq_times.shape[0]
+    n_series = int(np.max(series_idx)) + 1 if series_idx.size else 0
+    mat = np.zeros((n_times, n_series), dtype=np.float32)
+    w = weights[mask]
+    s_idx = series_idx[mask].astype(np.int64)
+    np.add.at(mat, (inv, s_idx), w)
+    return mat, uniq_times
+
+
+def _compute_weight_metrics(
+    weights: np.ndarray,
+    series_idx: np.ndarray,
+    time_key_hours: np.ndarray,
+    valid: np.ndarray,
+) -> Tuple[float, float, float, float]:
+    mat, times = _weight_matrix(weights, series_idx, time_key_hours, valid)
+    if mat.shape[0] < 2:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    diff = np.diff(mat, axis=0)
+    turnover_sum = float(np.sum(np.abs(diff)))
+    sign = np.sign(mat)
+    flip_rates = []
+    jaccards = []
+    for i in range(1, sign.shape[0]):
+        prev = sign[i - 1]
+        curr = sign[i]
+        active = (prev != 0) | (curr != 0)
+        denom = int(np.sum(active))
+        if denom:
+            flips = int(np.sum((prev * curr) < 0))
+            flip_rates.append(flips / denom)
+        active_prev = prev != 0
+        active_curr = curr != 0
+        union = int(np.sum(active_prev | active_curr))
+        if union:
+            inter = int(np.sum(active_prev & active_curr))
+            jaccards.append(inter / union)
+    flip_rate = float(np.mean(flip_rates)) if flip_rates else float("nan")
+    jaccard = float(np.mean(jaccards)) if jaccards else float("nan")
+
+    hold_durations = []
+    for s in range(sign.shape[1]):
+        s_sign = sign[:, s]
+        if not np.any(s_sign != 0):
+            continue
+        start_idx = 0
+        curr = s_sign[0]
+        for i in range(1, s_sign.shape[0]):
+            if s_sign[i] == curr:
+                continue
+            if curr != 0:
+                hold_durations.append(float(times[i] - times[start_idx]))
+            curr = s_sign[i]
+            start_idx = i
+        if curr != 0:
+            hold_durations.append(float(times[-1] - times[start_idx]))
+    avg_holding = float(np.mean(hold_durations)) if hold_durations else float("nan")
+
+    return turnover_sum, flip_rate, avg_holding, jaccard
 
 
 def _summarize(
@@ -125,6 +311,13 @@ def _summarize(
     size: np.ndarray,
     pnl: np.ndarray,
     origin_t: np.ndarray,
+    gross_pnl: np.ndarray | None = None,
+    cost_pnl: np.ndarray | None = None,
+    edge_prob: np.ndarray | None = None,
+    time_key_hours: np.ndarray | None = None,
+    rank_bucket: np.ndarray | None = None,
+    series_idx: np.ndarray | None = None,
+    hold_hours: np.ndarray | None = None,
 ) -> Dict[str, float | str]:
     valid = valid_mask > 0
     trade = valid & (side != 0)
@@ -136,7 +329,111 @@ def _summarize(
     std_pnl = float(np.std(pnl[trade])) if n_trades else float("nan")
     sharpe_trade = mean_pnl / (std_pnl + 1e-12) if n_trades else float("nan")
     avg_size = float(np.mean(size[trade])) if n_trades else float("nan")
-    mean_t, std_t, sharpe_t, max_dd = _compute_time_metrics(origin_t[valid], pnl[valid])
+    gross_exposure = np.abs(size * side)
+    (
+        mean_t,
+        std_t,
+        sharpe_t,
+        max_dd,
+        mean_t_norm,
+        std_t_norm,
+        sharpe_t_norm,
+    ) = _compute_time_metrics(origin_t[valid], pnl[valid], gross_exposure[valid])
+    avg_hold = float(np.mean(hold_hours[trade])) if hold_hours is not None and n_trades else float("nan")
+    trades_per_time = float("nan")
+    turnover = float("nan")
+    turnover_sum = float("nan")
+    flip_rate = float("nan")
+    avg_holding_time = float("nan")
+    jaccard = float("nan")
+    net_pnl_sum = float(np.sum(pnl[trade])) if n_trades else 0.0
+    gross_pnl_sum = float("nan")
+    cost_pnl_sum = float("nan")
+    turnover_tax = float("nan")
+    if gross_pnl is not None:
+        gross_pnl_sum = float(np.sum(gross_pnl[trade])) if n_trades else 0.0
+    if cost_pnl is not None:
+        cost_pnl_sum = float(np.sum(cost_pnl[trade])) if n_trades else 0.0
+    if not np.isnan(gross_pnl_sum):
+        turnover_tax = cost_pnl_sum / max(abs(gross_pnl_sum), 1e-12)
+    edge_p10 = float("nan")
+    edge_p50 = float("nan")
+    edge_p90 = float("nan")
+    if edge_prob is not None and n_trades:
+        edge_vals = edge_prob[trade]
+        edge_p10 = float(np.nanquantile(edge_vals, 0.10))
+        edge_p50 = float(np.nanquantile(edge_vals, 0.50))
+        edge_p90 = float(np.nanquantile(edge_vals, 0.90))
+    gross_p10 = float("nan")
+    gross_p50 = float("nan")
+    gross_p90 = float("nan")
+    gross_mean = float("nan")
+    if n_trades:
+        if hold_hours is not None:
+            group_key = np.stack((origin_t[trade], hold_hours[trade]), axis=1)
+            _, inv = np.unique(group_key, axis=0, return_inverse=True)
+        else:
+            times_trade = origin_t[trade]
+            _, inv = np.unique(times_trade, return_inverse=True)
+        gross_per_time = np.zeros(int(np.max(inv)) + 1, dtype=np.float64)
+        np.add.at(gross_per_time, inv, np.abs(size[trade] * side[trade]))
+        gross_p10 = float(np.quantile(gross_per_time, 0.10))
+        gross_p50 = float(np.quantile(gross_per_time, 0.50))
+        gross_p90 = float(np.quantile(gross_per_time, 0.90))
+        gross_mean = float(np.mean(gross_per_time))
+    time_delta_min = float("nan")
+    time_delta_med = float("nan")
+    time_delta_max = float("nan")
+    if time_key_hours is not None:
+        time_delta_min, time_delta_med, time_delta_max = _time_delta_stats(time_key_hours, valid)
+    if origin_t is not None and valid.any():
+        times = origin_t[valid]
+        uniq_times = np.unique(times)
+        n_times = max(len(uniq_times), 1)
+        trades_per_time = n_trades / n_times
+        if n_trades:
+            inv = np.searchsorted(uniq_times, origin_t[trade])
+            abs_size = np.zeros(len(uniq_times), dtype=np.float64)
+            np.add.at(abs_size, inv, np.abs(size[trade]))
+            turnover = float(np.mean(abs_size))
+    if time_key_hours is not None and series_idx is not None:
+        weights = side.astype(np.float32) * size
+        turnover_sum, flip_rate, avg_holding_time, jaccard = _compute_weight_metrics(
+            weights,
+            series_idx,
+            time_key_hours,
+            valid,
+        )
+    macro_pnl_trade = float("nan")
+    if series_idx is not None and n_trades:
+        series = series_idx[trade]
+        uniq_series, inv = np.unique(series, return_inverse=True)
+        pnl_sum = np.zeros(len(uniq_series), dtype=np.float64)
+        counts = np.zeros(len(uniq_series), dtype=np.float64)
+        np.add.at(pnl_sum, inv, pnl[trade])
+        np.add.at(counts, inv, 1.0)
+        per_series = pnl_sum / np.maximum(counts, 1.0)
+        macro_pnl_trade = float(np.mean(per_series))
+    rank1_gross = float("nan")
+    rank1_cost = float("nan")
+    rank1_net = float("nan")
+    rank2_gross = float("nan")
+    rank2_cost = float("nan")
+    rank2_net = float("nan")
+    rank1_trades = 0
+    rank2_trades = 0
+    if rank_bucket is not None and n_trades:
+        rank1_mask = trade & (rank_bucket == 1)
+        rank2_mask = trade & (rank_bucket == 2)
+        rank1_trades = int(np.sum(rank1_mask))
+        rank2_trades = int(np.sum(rank2_mask))
+        if gross_pnl is not None and cost_pnl is not None:
+            rank1_gross = float(np.sum(gross_pnl[rank1_mask])) if rank1_trades else 0.0
+            rank1_cost = float(np.sum(cost_pnl[rank1_mask])) if rank1_trades else 0.0
+            rank1_net = float(np.sum(pnl[rank1_mask])) if rank1_trades else 0.0
+            rank2_gross = float(np.sum(gross_pnl[rank2_mask])) if rank2_trades else 0.0
+            rank2_cost = float(np.sum(cost_pnl[rank2_mask])) if rank2_trades else 0.0
+            rank2_net = float(np.sum(pnl[rank2_mask])) if rank2_trades else 0.0
     return {
         "scope": scope,
         "n_valid": n_valid,
@@ -149,8 +446,41 @@ def _summarize(
         "mean_pnl_time": mean_t,
         "std_pnl_time": std_t,
         "sharpe_time": sharpe_t,
+        "mean_pnl_time_norm": mean_t_norm,
+        "std_pnl_time_norm": std_t_norm,
+        "sharpe_time_norm": sharpe_t_norm,
         "max_dd": max_dd,
+        "gross_pnl_sum": gross_pnl_sum,
+        "cost_pnl_sum": cost_pnl_sum,
+        "net_pnl_sum": net_pnl_sum,
+        "turnover_tax": turnover_tax,
+        "gross_exposure_mean": gross_mean,
+        "gross_exposure_p10": gross_p10,
+        "gross_exposure_p50": gross_p50,
+        "gross_exposure_p90": gross_p90,
+        "turnover_sum": turnover_sum,
+        "flip_rate": flip_rate,
+        "avg_holding_time": avg_holding_time,
+        "jaccard": jaccard,
+        "edge_prob_p10": edge_p10,
+        "edge_prob_p50": edge_p50,
+        "edge_prob_p90": edge_p90,
+        "time_delta_min_hours": time_delta_min,
+        "time_delta_median_hours": time_delta_med,
+        "time_delta_max_hours": time_delta_max,
+        "rank1_trades": rank1_trades,
+        "rank1_gross_pnl_sum": rank1_gross,
+        "rank1_cost_pnl_sum": rank1_cost,
+        "rank1_net_pnl_sum": rank1_net,
+        "rank2plus_trades": rank2_trades,
+        "rank2plus_gross_pnl_sum": rank2_gross,
+        "rank2plus_cost_pnl_sum": rank2_cost,
+        "rank2plus_net_pnl_sum": rank2_net,
         "avg_size": avg_size,
+        "avg_hold_time": avg_hold,
+        "trades_per_time": trades_per_time,
+        "turnover": turnover,
+        "macro_pnl_trade": macro_pnl_trade,
     }
 
 
@@ -161,17 +491,24 @@ def main() -> None:
     parser.add_argument("--out_summary", required=True)
     parser.add_argument("--out_trades", default=None)
     parser.add_argument("--rule", default="prob_cost", choices=["prob_cost", "conformal_bounds", "rank"])
-    parser.add_argument("--score_mode", default="mean", choices=["mean", "prob_edge"])
+    parser.add_argument("--score_mode", default="mean", choices=["mean", "prob_edge", "q50", "edge_prob"])
     parser.add_argument("--horizons", default="")
     parser.add_argument("--return_mode", default="diff", choices=["diff", "pct", "log"])
     parser.add_argument("--value_scale", default="orig", choices=["orig", "scaled"])
     parser.add_argument("--tau", type=float, default=0.60)
     parser.add_argument("--move_tau", type=float, default=0.0)
+    parser.add_argument("--min_edge_thresh", type=float, default=0.0)
     parser.add_argument("--cost_fixed", type=float, default=0.0)
     parser.add_argument("--cost_fixed_bps", type=float, default=None)
     parser.add_argument("--cost_unit", default="return", choices=["return", "bps"])
     parser.add_argument("--cost_k", type=float, default=0.0)
     parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--rebalance_hours", type=int, default=1)
+    parser.add_argument("--rank_normalize", action="store_true")
+    parser.add_argument("--rank_gross_exposure", type=float, default=1.0)
+    parser.add_argument("--width_drop_q", type=float, default=0.0)
+    parser.add_argument("--hold_min_hours", type=int, default=0)
+    parser.add_argument("--flip_penalty_bps", type=float, default=0.0)
     parser.add_argument(
         "--size_mode",
         default="fixed",
@@ -225,6 +562,10 @@ def main() -> None:
                 time_key[i] = int(np.asarray(s.timestamps[int(t)]).astype("datetime64[ns]").astype(np.int64))
     else:
         time_key = origin_t
+    time_key_hours = time_key.copy()
+    if args.group_by == "timestamp":
+        time_key_hours = (time_key_hours // (3600 * 1_000_000_000)).astype(np.int64)
+    time_key_hours = time_key_hours - int(np.min(time_key_hours))
 
     summaries = []
     trades_rows: List[Tuple] = []
@@ -232,7 +573,14 @@ def main() -> None:
     overall_side_list = []
     overall_size_list = []
     overall_pnl_list = []
+    overall_gross_list = []
+    overall_cost_list = []
     overall_time_list = []
+    overall_time_hours_list = []
+    overall_edge_list = []
+    overall_bucket_list = []
+    overall_hold_list = []
+    overall_series_list = []
 
     cost_fixed = float(args.cost_fixed)
     if args.cost_fixed_bps is not None:
@@ -241,13 +589,33 @@ def main() -> None:
         cost_fixed = float(args.cost_fixed) / 1e4
     if args.return_mode == "log":
         cost_fixed = float(np.log1p(cost_fixed))
+    flip_penalty = 0.0
+    if args.flip_penalty_bps > 0.0:
+        flip_penalty = float(args.flip_penalty_bps) / 1e4
+        if args.return_mode == "log":
+            flip_penalty = float(np.log1p(flip_penalty))
+
+    if args.min_edge_thresh > 0.0 and args.rule != "rank":
+        raise ValueError("min_edge_thresh is only supported with rule=rank.")
 
     for h in horizons:
         h_idx = h - 1
         valid = (mask[:, h_idx] > 0) & (origin_mask > 0)
         if not np.any(valid):
             summaries.append(
-                _summarize(f"h{h}", valid, np.zeros_like(valid), np.zeros_like(valid, dtype=np.float32), np.zeros_like(valid, dtype=np.float32), time_key)
+                _summarize(
+                    f"h{h}",
+                    valid,
+                    np.zeros_like(valid),
+                    np.zeros_like(valid, dtype=np.float32),
+                    np.zeros_like(valid, dtype=np.float32),
+                    time_key,
+                    gross_pnl=np.zeros_like(valid, dtype=np.float32),
+                    cost_pnl=np.zeros_like(valid, dtype=np.float32),
+                    edge_prob=np.full_like(valid, np.nan, dtype=np.float32),
+                    time_key_hours=time_key_hours,
+                    rank_bucket=np.zeros_like(valid, dtype=np.int8),
+                )
             )
             continue
 
@@ -294,7 +662,15 @@ def main() -> None:
             p_minus = _normal_cdf(z_minus)
             p_move = p_plus + p_minus
 
+        if args.width_drop_q > 0.0 and np.any(valid):
+            thr = float(np.quantile(width[valid], args.width_drop_q))
+            valid &= width <= thr
+
+        if args.rebalance_hours > 1:
+            valid &= (time_key_hours % args.rebalance_hours) == 0
+
         side = np.zeros_like(mu_r, dtype=np.int8)
+        rank_bucket = np.zeros_like(mu_r, dtype=np.int8)
         if args.rule == "prob_cost":
             take_long = (p_plus > args.tau) & (p_plus >= p_minus)
             take_short = (p_minus > args.tau) & (p_minus > p_plus)
@@ -306,9 +682,28 @@ def main() -> None:
         elif args.rule == "rank":
             score = _select_scores(args.score_mode, mu_r, p_plus, p_minus)
             side = _assign_rank_sides(score, time_key, valid, args.topk)
+            rank_bucket = _assign_rank_buckets(score, time_key, valid, args.topk)
+            if args.min_edge_thresh > 0.0:
+                if args.score_mode not in {"prob_edge", "edge_prob"}:
+                    raise ValueError("min_edge_thresh requires score_mode=prob_edge or edge_prob.")
+                if p_plus is None or p_minus is None:
+                    raise ValueError("min_edge_thresh requires p_plus/p_minus.")
+                drop_long = (side > 0) & (p_plus < args.min_edge_thresh)
+                drop_short = (side < 0) & (p_minus < args.min_edge_thresh)
+                side[drop_long | drop_short] = 0
 
         if p_move is not None and args.move_tau > 0.0:
             side[p_move < args.move_tau] = 0
+
+        side, extra_cost = _apply_hold_and_flip(
+            side,
+            valid,
+            series_idx,
+            time_key_hours,
+            args.hold_min_hours,
+            flip_penalty,
+        )
+        cost = cost + extra_cost
 
         if args.size_mode == "fixed":
             size = np.ones_like(mu_r, dtype=np.float32)
@@ -326,14 +721,52 @@ def main() -> None:
 
         side[~valid] = 0
         size = np.where(valid, size, 0.0)
-        pnl = side.astype(np.float32) * size * y_true - cost * size * (side != 0)
+        if args.rule == "rank" and args.rank_normalize:
+            size = _normalize_rank_exposure(
+                size,
+                side,
+                valid,
+                time_key,
+                args.rank_gross_exposure,
+            )
+        gross_pnl = side.astype(np.float32) * size * y_true
+        cost_pnl = cost * size * (side != 0)
+        pnl = gross_pnl - cost_pnl
 
-        summaries.append(_summarize(f"h{h}", valid, side, size, pnl, time_key))
+        edge_prob = np.full_like(mu_r, np.nan, dtype=np.float32)
+        if p_plus is not None and p_minus is not None:
+            edge_prob = np.where(side > 0, p_plus, np.where(side < 0, p_minus, np.nan))
+
+        hold_hours = np.full_like(y_true, h, dtype=np.int32)
+        summaries.append(
+            _summarize(
+                f"h{h}",
+                valid,
+                side,
+                size,
+                pnl,
+                time_key,
+                gross_pnl=gross_pnl,
+                cost_pnl=cost_pnl,
+                edge_prob=edge_prob,
+                time_key_hours=time_key_hours,
+                rank_bucket=rank_bucket,
+                series_idx=series_idx,
+                hold_hours=hold_hours,
+            )
+        )
         overall_valid_list.append(valid)
         overall_side_list.append(side)
         overall_size_list.append(size)
         overall_pnl_list.append(pnl)
+        overall_gross_list.append(gross_pnl)
+        overall_cost_list.append(cost_pnl)
         overall_time_list.append(time_key.copy())
+        overall_time_hours_list.append(time_key_hours.copy())
+        overall_edge_list.append(edge_prob)
+        overall_bucket_list.append(rank_bucket)
+        overall_hold_list.append(hold_hours)
+        overall_series_list.append(series_idx.copy())
 
         if args.out_trades:
             for i in np.where(valid & (side != 0))[0]:
@@ -341,6 +774,7 @@ def main() -> None:
                     (
                         int(series_idx[i]),
                         int(origin_t[i]),
+                        h,
                         h,
                         int(side[i]),
                         float(size[i]),
@@ -358,8 +792,31 @@ def main() -> None:
         all_side = np.concatenate(overall_side_list, axis=0)
         all_size = np.concatenate(overall_size_list, axis=0)
         all_pnl = np.concatenate(overall_pnl_list, axis=0)
+        all_gross = np.concatenate(overall_gross_list, axis=0)
+        all_cost = np.concatenate(overall_cost_list, axis=0)
         all_time = np.concatenate(overall_time_list, axis=0)
-        summaries.append(_summarize("all", all_valid, all_side, all_size, all_pnl, all_time))
+        all_time_hours = np.concatenate(overall_time_hours_list, axis=0)
+        all_edge = np.concatenate(overall_edge_list, axis=0) if overall_edge_list else None
+        all_bucket = np.concatenate(overall_bucket_list, axis=0) if overall_bucket_list else None
+        all_hold = np.concatenate(overall_hold_list, axis=0)
+        all_series = np.concatenate(overall_series_list, axis=0)
+        summaries.append(
+            _summarize(
+                "all",
+                all_valid,
+                all_side,
+                all_size,
+                all_pnl,
+                all_time,
+                gross_pnl=all_gross,
+                cost_pnl=all_cost,
+                edge_prob=all_edge,
+                time_key_hours=all_time_hours,
+                rank_bucket=all_bucket,
+                series_idx=all_series,
+                hold_hours=all_hold,
+            )
+        )
 
     out_summary = Path(args.out_summary)
     out_summary.parent.mkdir(parents=True, exist_ok=True)
@@ -378,6 +835,7 @@ def main() -> None:
                     "series_idx",
                     "origin_t",
                     "h",
+                    "hold_hours",
                     "side",
                     "size",
                     "r_true",
@@ -388,6 +846,29 @@ def main() -> None:
                 ]
             )
             writer.writerows(trades_rows)
+
+    all_row = next((row for row in summaries if row.get("scope") == "all"), None)
+    if all_row is not None:
+        print(
+            "run_summary",
+            f"n_trades={all_row.get('n_trades')}",
+            f"gross_pnl_sum={all_row.get('gross_pnl_sum')}",
+            f"cost_pnl_sum={all_row.get('cost_pnl_sum')}",
+            f"net_pnl_sum={all_row.get('net_pnl_sum')}",
+            f"turnover_tax={all_row.get('turnover_tax')}",
+            f"turnover_sum={all_row.get('turnover_sum')}",
+            f"flip_rate={all_row.get('flip_rate')}",
+            f"jaccard={all_row.get('jaccard')}",
+            f"gross_exposure_p10={all_row.get('gross_exposure_p10')}",
+            f"gross_exposure_p50={all_row.get('gross_exposure_p50')}",
+            f"gross_exposure_p90={all_row.get('gross_exposure_p90')}",
+            f"edge_prob_p10={all_row.get('edge_prob_p10')}",
+            f"edge_prob_p50={all_row.get('edge_prob_p50')}",
+            f"edge_prob_p90={all_row.get('edge_prob_p90')}",
+            f"time_delta_min_hours={all_row.get('time_delta_min_hours')}",
+            f"time_delta_median_hours={all_row.get('time_delta_median_hours')}",
+            f"time_delta_max_hours={all_row.get('time_delta_max_hours')}",
+        )
 
 
 if __name__ == "__main__":
