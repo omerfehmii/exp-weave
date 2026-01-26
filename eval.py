@@ -170,6 +170,18 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
     gate_cfg = patch_cfg.get("gate", {})
     scale_drop_cfg = patch_cfg.get("scale_drop", {})
     dir_head_cfg = cfg.get("direction_head", {})
+    cumret_cfg = cfg.get("cumret24_head", {})
+    cumret_enabled = False
+    if isinstance(cumret_cfg, dict):
+        cumret_enabled = bool(cumret_cfg.get("enabled", False))
+    elif isinstance(cumret_cfg, bool):
+        cumret_enabled = bool(cumret_cfg)
+    cumret_model = model_cfg.get("cumret24_head", None)
+    if cumret_model is not None:
+        if isinstance(cumret_model, dict):
+            cumret_enabled = bool(cumret_model.get("enabled", False))
+        else:
+            cumret_enabled = bool(cumret_model)
     config = ModelConfig(
         L=data_cfg["L"],
         H=data_cfg["H"],
@@ -215,6 +227,7 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         dir_head_type=dir_head_cfg.get("type", "hierarchical"),
         dir_head_detach=dir_head_cfg.get("detach", False),
         dir_head_dropout=dir_head_cfg.get("dropout", 0.0),
+        cumret24_head=cumret_enabled,
         moe_enabled=bool(moe_cfg.get("enabled", False)),
         moe_gate_hidden=int(moe_cfg.get("gate_hidden", model_cfg.get("d_model", 256))),
         moe_gate_temperature=float(moe_cfg.get("gate_temperature", 1.0)),
@@ -659,7 +672,11 @@ def main() -> None:
     model = build_model(cfg)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model.load_state_dict(checkpoint["model_state"])
-    device = torch.device(cfg["training"].get("device", "cpu"))
+    device_str = cfg["training"].get("device", "cpu")
+    if str(device_str).startswith("cuda") and not torch.cuda.is_available():
+        print("warning: cuda requested but not available; falling back to cpu")
+        device_str = "cpu"
+    device = torch.device(device_str)
     model.to(device)
     model.eval()
     regime_thresholds = None

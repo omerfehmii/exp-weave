@@ -502,6 +502,7 @@ def main() -> None:
     repulsion_weight = loss_cfg.get("repulsion_weight", 0.0)
     repulsion_scale = loss_cfg.get("repulsion_scale", 1.0)
     cumret24_weight = float(loss_cfg.get("cumret24_weight", 0.0))
+    cumret24_warmup_epochs = int(loss_cfg.get("cumret24_warmup_epochs", 0))
     gate_entropy_weight = float(gate_cfg.get("entropy_weight", 0.0))
     moe_entropy_weight = float(loss_cfg.get("moe_entropy_weight", 0.0))
     moe_balance_weight = float(loss_cfg.get("moe_balance_weight", 0.0))
@@ -551,6 +552,9 @@ def main() -> None:
     global_step = 0
     for epoch in range(epochs):
         epoch_start = time.time()
+        cumret24_weight_used = 0.0 if epoch < cumret24_warmup_epochs else cumret24_weight
+        if cumret24_warmup_epochs > 0 or cumret24_weight > 0:
+            print(f"cumret24_weight_used={cumret24_weight_used:.4f}")
         model.train()
         total_loss = 0.0
         running_loss = 0.0
@@ -579,7 +583,7 @@ def main() -> None:
                 repulsion = torch.exp(-width / max(repulsion_scale, 1e-6)) * mask
                 denom = torch.clamp(mask.sum(), min=1.0)
                 main_loss = main_loss + repulsion_weight * (repulsion.sum() / denom)
-            if cumret24_weight > 0:
+            if cumret24_weight_used > 0:
                 if "cumret24" not in extras:
                     raise RuntimeError("cumret24_weight>0 but model did not return cumret24. Enable cumret24_head.")
                 h_idx = min(y_true.shape[1] - 1, cfg["data"]["H"] - 1)
@@ -591,7 +595,7 @@ def main() -> None:
                 mask_h = mask[:, h_idx]
                 denom = torch.clamp(mask_h.sum(), min=1.0)
                 cumret_loss = torch.sum((pred_h - target_h) ** 2 * mask_h) / denom
-                main_loss = main_loss + cumret24_weight * cumret_loss
+                main_loss = main_loss + cumret24_weight_used * cumret_loss
             if gate_entropy_weight > 0 and "gate_weights" in extras:
                 w = torch.clamp(extras["gate_weights"], 1e-8, 1.0)
                 ent = -torch.sum(w * torch.log(w), dim=-1).mean()
@@ -806,7 +810,7 @@ def main() -> None:
                 mask = torch.isfinite(y_true).float()
                 y_true = torch.nan_to_num(y_true, nan=0.0)
                 val_main = pinball_weight * masked_pinball_loss_torch(y_true, q_hat, quantiles, mask, quantile_weights)
-                if cumret24_weight > 0:
+                if cumret24_weight_used > 0:
                     if "cumret24" not in extras:
                         raise RuntimeError("cumret24_weight>0 but model did not return cumret24. Enable cumret24_head.")
                     h_idx = min(y_true.shape[1] - 1, cfg["data"]["H"] - 1)
@@ -818,7 +822,7 @@ def main() -> None:
                     mask_h = mask[:, h_idx]
                     denom = torch.clamp(mask_h.sum(), min=1.0)
                     cumret_loss = torch.sum((pred_h - target_h) ** 2 * mask_h) / denom
-                    val_main = val_main + cumret24_weight * cumret_loss
+                    val_main = val_main + cumret24_weight_used * cumret_loss
                 val_loss += val_main.item()
                 if dir_enabled:
                     y_last = batch["y_past"][:, -1, 0]
@@ -952,6 +956,8 @@ def main() -> None:
                 record["dir_loss"] = val_dir_loss
             if val_dir_wmcc is not None:
                 record["dir_wmcc"] = val_dir_wmcc
+            if cumret24_warmup_epochs > 0 or cumret24_weight > 0:
+                record["cumret24_weight"] = cumret24_weight_used
             append_log(log_path, record)
 
         if early_metric == "auto":

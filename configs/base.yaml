@@ -91,6 +91,7 @@ training:
     pinball_weight: 1.0
     mae_weight: 0.0
     cumret24_weight: 0.0
+    cumret24_warmup_epochs: 0
     moe_entropy_weight: 0.0
     moe_balance_weight: 0.0
   optimizer:
