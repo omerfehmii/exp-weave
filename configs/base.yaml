@@ -87,6 +87,14 @@ training:
   device: cpu
   grad_clip: 1.0
   output_path: artifacts/model.pt
+  resume_from: null
+  resume_optimizer: true
+  resume_reset_epoch: false
+  resume_reset_lr: true
+  save_every_epoch: false
+  coverage_guard_min: null
+  coverage_guard_max: null
+  coverage_guard_fail: false
   loss:
     pinball_weight: 1.0
     mae_weight: 0.0

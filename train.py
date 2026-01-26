@@ -452,12 +452,30 @@ def main() -> None:
         lr=optim_cfg.get("lr", 1e-3),
         weight_decay=optim_cfg.get("weight_decay", 0.01),
     )
+    resume_from = cfg["training"].get("resume_from")
+    resume_optimizer = bool(cfg["training"].get("resume_optimizer", True))
+    resume_reset_epoch = bool(cfg["training"].get("resume_reset_epoch", False))
+    resume_reset_lr = bool(cfg["training"].get("resume_reset_lr", True))
+    start_epoch = 0
+    if resume_from:
+        checkpoint = torch.load(resume_from, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state"])
+        if resume_optimizer and "optimizer_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if resume_reset_lr:
+            lr = optim_cfg.get("lr", 1e-3)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+        if not resume_reset_epoch and "epoch" in checkpoint:
+            start_epoch = int(checkpoint["epoch"]) + 1
     grad_clip = cfg["training"].get("grad_clip", 1.0)
     quantiles = cfg["data"]["quantiles"]
     q50_idx = quantiles.index(0.5) if 0.5 in quantiles else len(quantiles) // 2
     q10_idx = quantiles.index(0.1) if 0.1 in quantiles else None
     q90_idx = quantiles.index(0.9) if 0.9 in quantiles else None
     epochs = cfg["training"].get("epochs", 10)
+    if start_epoch >= epochs:
+        raise RuntimeError(f"resume start_epoch={start_epoch} >= epochs={epochs}")
     early_cfg = cfg["training"].get("early_stopping", {})
     early_enabled = early_cfg.get("enabled", False)
     early_patience = early_cfg.get("patience", 2)
@@ -546,11 +564,17 @@ def main() -> None:
     log_path = cfg["training"].get("log_path")
     log_every = cfg["training"].get("log_every", 200)
     log_path = Path(log_path) if log_path else None
+    output_path = Path(cfg["training"].get("output_path", "model.pt"))
+    save_every_epoch = bool(cfg["training"].get("save_every_epoch", False))
+    cov_guard_min = cfg["training"].get("coverage_guard_min", None)
+    cov_guard_max = cfg["training"].get("coverage_guard_max", None)
+    cov_guard_fail = bool(cfg["training"].get("coverage_guard_fail", False))
+    last_val_cov = None
 
     print(f"train_samples={len(train_idx)} val_samples={len(val_idx)}")
 
     global_step = 0
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         epoch_start = time.time()
         cumret24_weight_used = 0.0 if epoch < cumret24_warmup_epochs else cumret24_weight
         if cumret24_warmup_epochs > 0 or cumret24_weight > 0:
@@ -925,6 +949,7 @@ def main() -> None:
         if cov_batches > 0:
             val_cov /= cov_batches
             val_width /= cov_batches
+            last_val_cov = val_cov
             print(
                 f"epoch={epoch} train_loss={total_loss/len(train_loader):.4f} "
                 f"val_loss={val_loss:.4f} val_cov80={val_cov:.4f} val_width80={val_width:.4f} "
@@ -959,6 +984,17 @@ def main() -> None:
             if cumret24_warmup_epochs > 0 or cumret24_weight > 0:
                 record["cumret24_weight"] = cumret24_weight_used
             append_log(log_path, record)
+        if save_every_epoch:
+            epoch_path = output_path.with_name(f"{output_path.stem}_epoch{epoch}{output_path.suffix}")
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "config": cfg,
+                },
+                epoch_path,
+            )
 
         if early_metric == "auto":
             if pinball_weight > 0:
@@ -1006,7 +1042,6 @@ def main() -> None:
                 best_epoch_dir = epoch
                 best_state_dir = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    output_path = Path(cfg["training"].get("output_path", "model.pt"))
     save_last = bool(cfg["training"].get("save_last", False))
     output_path_last = cfg["training"].get("output_path_last")
     output_path_best_loss = cfg["training"].get("output_path_best_loss")
@@ -1015,7 +1050,15 @@ def main() -> None:
     save_best_dir = bool(cfg["training"].get("save_best_dir", False)) or output_path_best_dir is not None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     state = best_state if best_state is not None else model.state_dict()
-    torch.save({"model_state": state, "config": cfg}, output_path)
+    torch.save(
+        {
+            "model_state": state,
+            "optimizer_state": optimizer.state_dict(),
+            "epoch": epoch,
+            "config": cfg,
+        },
+        output_path,
+    )
     if save_last:
         if output_path_last:
             last_path = Path(output_path_last)
@@ -1023,7 +1066,15 @@ def main() -> None:
             last_path = output_path.with_name(output_path.stem + "_last" + output_path.suffix)
         last_path.parent.mkdir(parents=True, exist_ok=True)
         last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        torch.save({"model_state": last_state, "config": cfg}, last_path)
+        torch.save(
+            {
+                "model_state": last_state,
+                "optimizer_state": optimizer.state_dict(),
+                "epoch": epoch,
+                "config": cfg,
+            },
+            last_path,
+        )
     if save_best_loss and best_state_loss is not None:
         if output_path_best_loss:
             loss_path = Path(output_path_best_loss)
@@ -1038,6 +1089,20 @@ def main() -> None:
             dir_path = output_path.with_name(output_path.stem + "_best_dir" + output_path.suffix)
         dir_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model_state": best_state_dir, "config": cfg}, dir_path)
+    if cov_guard_min is not None or cov_guard_max is not None:
+        if last_val_cov is None or not np.isfinite(last_val_cov):
+            msg = "coverage_guard: val_cov unavailable"
+            if cov_guard_fail:
+                raise RuntimeError(msg)
+            print(f"warning: {msg}")
+        else:
+            min_ok = cov_guard_min is None or last_val_cov >= float(cov_guard_min)
+            max_ok = cov_guard_max is None or last_val_cov <= float(cov_guard_max)
+            if not (min_ok and max_ok):
+                msg = f"coverage_guard_failed: val_cov80={last_val_cov:.4f} not in [{cov_guard_min},{cov_guard_max}]"
+                if cov_guard_fail:
+                    raise RuntimeError(msg)
+                print(f"warning: {msg}")
 
 
 if __name__ == "__main__":
