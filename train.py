@@ -235,6 +235,18 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
     gate_cfg = patch_cfg.get("gate", {})
     scale_drop_cfg = patch_cfg.get("scale_drop", {})
     dir_head_cfg = cfg.get("direction_head", {})
+    cumret_cfg = cfg.get("cumret24_head", {})
+    cumret_enabled = False
+    if isinstance(cumret_cfg, dict):
+        cumret_enabled = bool(cumret_cfg.get("enabled", False))
+    elif isinstance(cumret_cfg, bool):
+        cumret_enabled = bool(cumret_cfg)
+    cumret_model = model_cfg.get("cumret24_head", None)
+    if cumret_model is not None:
+        if isinstance(cumret_model, dict):
+            cumret_enabled = bool(cumret_model.get("enabled", False))
+        else:
+            cumret_enabled = bool(cumret_model)
     config = ModelConfig(
         L=data_cfg["L"],
         H=data_cfg["H"],
@@ -280,6 +292,7 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         dir_head_type=dir_head_cfg.get("type", "hierarchical"),
         dir_head_detach=dir_head_cfg.get("detach", False),
         dir_head_dropout=dir_head_cfg.get("dropout", 0.0),
+        cumret24_head=cumret_enabled,
         moe_enabled=bool(moe_cfg.get("enabled", False)),
         moe_gate_hidden=int(moe_cfg.get("gate_hidden", model_cfg.get("d_model", 256))),
         moe_gate_temperature=float(moe_cfg.get("gate_temperature", 1.0)),
@@ -488,6 +501,7 @@ def main() -> None:
     width_min_weight = loss_cfg.get("width_min_weight", 0.0)
     repulsion_weight = loss_cfg.get("repulsion_weight", 0.0)
     repulsion_scale = loss_cfg.get("repulsion_scale", 1.0)
+    cumret24_weight = float(loss_cfg.get("cumret24_weight", 0.0))
     gate_entropy_weight = float(gate_cfg.get("entropy_weight", 0.0))
     moe_entropy_weight = float(loss_cfg.get("moe_entropy_weight", 0.0))
     moe_balance_weight = float(loss_cfg.get("moe_balance_weight", 0.0))
@@ -565,6 +579,19 @@ def main() -> None:
                 repulsion = torch.exp(-width / max(repulsion_scale, 1e-6)) * mask
                 denom = torch.clamp(mask.sum(), min=1.0)
                 main_loss = main_loss + repulsion_weight * (repulsion.sum() / denom)
+            if cumret24_weight > 0:
+                if "cumret24" not in extras:
+                    raise RuntimeError("cumret24_weight>0 but model did not return cumret24. Enable cumret24_head.")
+                h_idx = min(y_true.shape[1] - 1, cfg["data"]["H"] - 1)
+                target_h = y_true[:, h_idx]
+                if target_mode == "level":
+                    y_last = batch["y_past"][:, -1, 0]
+                    target_h = target_h - y_last
+                pred_h = extras["cumret24"]
+                mask_h = mask[:, h_idx]
+                denom = torch.clamp(mask_h.sum(), min=1.0)
+                cumret_loss = torch.sum((pred_h - target_h) ** 2 * mask_h) / denom
+                main_loss = main_loss + cumret24_weight * cumret_loss
             if gate_entropy_weight > 0 and "gate_weights" in extras:
                 w = torch.clamp(extras["gate_weights"], 1e-8, 1.0)
                 ent = -torch.sum(w * torch.log(w), dim=-1).mean()
@@ -778,7 +805,21 @@ def main() -> None:
                 y_true = target[..., 0]
                 mask = torch.isfinite(y_true).float()
                 y_true = torch.nan_to_num(y_true, nan=0.0)
-                val_loss += (pinball_weight * masked_pinball_loss_torch(y_true, q_hat, quantiles, mask, quantile_weights)).item()
+                val_main = pinball_weight * masked_pinball_loss_torch(y_true, q_hat, quantiles, mask, quantile_weights)
+                if cumret24_weight > 0:
+                    if "cumret24" not in extras:
+                        raise RuntimeError("cumret24_weight>0 but model did not return cumret24. Enable cumret24_head.")
+                    h_idx = min(y_true.shape[1] - 1, cfg["data"]["H"] - 1)
+                    target_h = y_true[:, h_idx]
+                    if target_mode == "level":
+                        y_last = batch["y_past"][:, -1, 0]
+                        target_h = target_h - y_last
+                    pred_h = extras["cumret24"]
+                    mask_h = mask[:, h_idx]
+                    denom = torch.clamp(mask_h.sum(), min=1.0)
+                    cumret_loss = torch.sum((pred_h - target_h) ** 2 * mask_h) / denom
+                    val_main = val_main + cumret24_weight * cumret_loss
+                val_loss += val_main.item()
                 if dir_enabled:
                     y_last = batch["y_past"][:, -1, 0]
                     if target_mode != "level":
@@ -882,7 +923,7 @@ def main() -> None:
             val_width /= cov_batches
             print(
                 f"epoch={epoch} train_loss={total_loss/len(train_loader):.4f} "
-                f"val_loss={val_loss:.4f} val_cov90={val_cov:.4f} val_width90={val_width:.4f} "
+                f"val_loss={val_loss:.4f} val_cov80={val_cov:.4f} val_width80={val_width:.4f} "
                 f"epoch_time_s={epoch_time:.1f}"
             )
         else:
@@ -905,8 +946,8 @@ def main() -> None:
                 "epoch_time_s": epoch_time,
             }
             if cov_batches > 0:
-                record["coverage90"] = val_cov
-                record["width90"] = val_width
+                record["coverage80"] = val_cov
+                record["width80"] = val_width
             if dir_batches > 0:
                 record["dir_loss"] = val_dir_loss
             if val_dir_wmcc is not None:

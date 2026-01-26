@@ -71,6 +71,7 @@ class ModelConfig:
     dir_head_type: str = "hierarchical"  # hierarchical or three_class
     dir_head_detach: bool = False
     dir_head_dropout: float = 0.0
+    cumret24_head: bool = False
     use_series_id: bool = False
     series_id_vocab: Optional[int] = None
 
@@ -177,6 +178,11 @@ class MultiScaleForecastModel(nn.Module):
             self.dir_logits3 = None
             self.dir_move = None
             self.dir_dir = None
+        self.cumret24_head_enabled = cfg.cumret24_head
+        if self.cumret24_head_enabled:
+            self.cumret24_head = nn.Linear(cfg.d_model, 1)
+        else:
+            self.cumret24_head = None
         if cfg.use_series_id:
             if cfg.series_id_vocab is None:
                 raise ValueError("series_id_vocab required when use_series_id is True.")
@@ -350,6 +356,13 @@ class MultiScaleForecastModel(nn.Module):
             else:
                 extras["dir_move_logits"] = self.dir_move(dir_in).squeeze(-1)
                 extras["dir_dir_logits"] = self.dir_dir(dir_in).squeeze(-1)
+        if self.cumret24_head_enabled:
+            if dual_path:
+                cumret_in = dec_masked
+            else:
+                cumret_in = dec_out
+            h_idx = min(self.cfg.H - 1, cumret_in.shape[1] - 1)
+            extras["cumret24"] = self.cumret24_head(cumret_in[:, h_idx, :]).squeeze(-1)
         if cats_mask is not None:
             extras["cats_keep"] = cats_mask
         if return_attn and attn is not None:
