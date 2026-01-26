@@ -520,6 +520,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    target_mode = cfg.get("data", {}).get("target_mode", "level")
+    use_return_target = target_mode != "level"
     preds = np.load(args.preds)
     if "origin_t" not in preds or "series_idx" not in preds:
         raise ValueError("preds npz must include origin_t and series_idx.")
@@ -545,13 +547,24 @@ def main() -> None:
         scale_y=cfg["data"].get("scale_y", True),
     )
     if args.value_scale == "orig":
-        y = pre.inverse_y(y)
-        q10 = pre.inverse_y(q10)
-        q50 = pre.inverse_y(q50)
-        q90 = pre.inverse_y(q90)
+        if use_return_target:
+            y = pre.inverse_return(y)
+            q10 = pre.inverse_return(q10)
+            q50 = pre.inverse_return(q50)
+            q90 = pre.inverse_return(q90)
+        else:
+            y = pre.inverse_y(y)
+            q10 = pre.inverse_y(q10)
+            q50 = pre.inverse_y(q50)
+            q90 = pre.inverse_y(q90)
     y0, origin_mask = _origin_values(series_list, series_idx, origin_t)
     if args.value_scale == "orig":
-        y0 = pre.inverse_y(y0)
+        if use_return_target:
+            y0 = pre.inverse_return(y0)
+        else:
+            y0 = pre.inverse_y(y0)
+    if use_return_target:
+        y0 = np.zeros_like(y0)
 
     H = q50.shape[1]
     horizons = _parse_horizons(args.horizons, H)
@@ -630,23 +643,24 @@ def main() -> None:
         q50_h = q50[:, h_idx]
         q90_h = q90[:, h_idx]
 
-        if args.return_mode == "pct":
-            denom = np.maximum(np.abs(y0), 1e-8)
-            y_true = (y_true - y0) / denom
-            q10_h = (q10_h - y0) / denom
-            q50_h = (q50_h - y0) / denom
-            q90_h = (q90_h - y0) / denom
-        elif args.return_mode == "log":
-            valid &= (y0 > 0) & (y_true > 0) & (q10_h > 0) & (q50_h > 0) & (q90_h > 0)
-            y_true = np.log(y_true) - np.log(y0)
-            q10_h = np.log(q10_h) - np.log(y0)
-            q50_h = np.log(q50_h) - np.log(y0)
-            q90_h = np.log(q90_h) - np.log(y0)
-        else:
-            y_true = y_true - y0
-            q10_h = q10_h - y0
-            q50_h = q50_h - y0
-            q90_h = q90_h - y0
+        if not use_return_target:
+            if args.return_mode == "pct":
+                denom = np.maximum(np.abs(y0), 1e-8)
+                y_true = (y_true - y0) / denom
+                q10_h = (q10_h - y0) / denom
+                q50_h = (q50_h - y0) / denom
+                q90_h = (q90_h - y0) / denom
+            elif args.return_mode == "log":
+                valid &= (y0 > 0) & (y_true > 0) & (q10_h > 0) & (q50_h > 0) & (q90_h > 0)
+                y_true = np.log(y_true) - np.log(y0)
+                q10_h = np.log(q10_h) - np.log(y0)
+                q50_h = np.log(q50_h) - np.log(y0)
+                q90_h = np.log(q90_h) - np.log(y0)
+            else:
+                y_true = y_true - y0
+                q10_h = q10_h - y0
+                q50_h = q50_h - y0
+                q90_h = q90_h - y0
         if not np.all(valid):
             y_true = np.where(valid, y_true, 0.0)
             q10_h = np.where(valid, q10_h, 0.0)
