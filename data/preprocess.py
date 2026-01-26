@@ -68,3 +68,10 @@ class FoldFitPreprocessor:
 
     def inverse_y(self, y: np.ndarray) -> np.ndarray:
         return self.y_scaler.inverse_transform(y) if self.scale_y else y
+
+    def inverse_return(self, r: np.ndarray) -> np.ndarray:
+        if not self.scale_y:
+            return r
+        if self.y_scaler.std is None:
+            raise RuntimeError("Scaler has not been fit.")
+        return r * self.y_scaler.std

@@ -512,9 +512,10 @@ def main() -> None:
     parser.add_argument(
         "--size_mode",
         default="fixed",
-        choices=["fixed", "edge", "edge_over_var", "inv_width", "edge_over_width2"],
+        choices=["fixed", "edge", "edge_over_var", "inv_width", "edge_over_width2", "mu_over_sigma"],
     )
     parser.add_argument("--size_cap", type=float, default=5.0)
+    parser.add_argument("--size_zero_k", type=float, default=0.0)
     parser.add_argument("--group_by", default="origin", choices=["origin", "timestamp"])
     args = parser.parse_args()
 
@@ -537,7 +538,12 @@ def main() -> None:
         cfg["data"].get("train_frac", 0.7),
         cfg["data"].get("val_frac", 0.15),
     )
-    pre = apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    pre = apply_scaling(
+        series_list,
+        split.train_end,
+        scale_x=cfg["data"].get("scale_x", True),
+        scale_y=cfg["data"].get("scale_y", True),
+    )
     if args.value_scale == "orig":
         y = pre.inverse_y(y)
         q10 = pre.inverse_y(q10)
@@ -695,6 +701,14 @@ def main() -> None:
         if p_move is not None and args.move_tau > 0.0:
             side[p_move < args.move_tau] = 0
 
+        size = None
+        if args.size_mode == "mu_over_sigma":
+            pos = mu_r / (sigma + 1e-12)
+            if args.size_zero_k > 0.0:
+                pos = np.where(np.abs(mu_r) >= args.size_zero_k * sigma, pos, 0.0)
+            side = np.sign(pos).astype(np.int8)
+            size = np.abs(pos).astype(np.float32)
+
         side, extra_cost = _apply_hold_and_flip(
             side,
             valid,
@@ -705,18 +719,19 @@ def main() -> None:
         )
         cost = cost + extra_cost
 
-        if args.size_mode == "fixed":
-            size = np.ones_like(mu_r, dtype=np.float32)
-        elif args.size_mode == "edge":
-            size = np.abs(mu_r)
-        elif args.size_mode == "edge_over_var":
-            size = np.abs(mu_r) / (sigma**2 + 1e-12)
-        elif args.size_mode == "inv_width":
-            size = 1.0 / (width + 1e-12)
-        elif args.size_mode == "edge_over_width2":
-            size = np.abs(mu_r) / (width**2 + 1e-12)
-        else:
-            raise ValueError(f"Unknown size_mode: {args.size_mode}")
+        if size is None:
+            if args.size_mode == "fixed":
+                size = np.ones_like(mu_r, dtype=np.float32)
+            elif args.size_mode == "edge":
+                size = np.abs(mu_r)
+            elif args.size_mode == "edge_over_var":
+                size = np.abs(mu_r) / (sigma**2 + 1e-12)
+            elif args.size_mode == "inv_width":
+                size = 1.0 / (width + 1e-12)
+            elif args.size_mode == "edge_over_width2":
+                size = np.abs(mu_r) / (width**2 + 1e-12)
+            else:
+                raise ValueError(f"Unknown size_mode: {args.size_mode}")
         size = np.minimum(size, args.size_cap)
 
         side[~valid] = 0

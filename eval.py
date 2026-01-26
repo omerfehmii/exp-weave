@@ -26,6 +26,17 @@ from data.preprocess import FoldFitPreprocessor
 from model import ModelConfig, MultiScaleForecastModel, PatchScale
 from utils import load_config, set_seed
 from width_scaling import apply_width_scaling, fit_s_global, fit_s_per_horizon
+from regime import (
+    REGIME_NAMES,
+    REGIME_TREND,
+    REGIME_RANGE_MR,
+    REGIME_CHOP_VOL,
+    REGIME_JUMPY,
+    compute_regime_features_np,
+    compute_regime_features_torch,
+    fit_regime_thresholds,
+    label_regimes,
+)
 from interval_clamp import apply_min_half_clamp, fit_min_half_abs, fit_min_half_rel, half_stats
 
 
@@ -103,7 +114,12 @@ def build_series_list(path: str, observed_only: bool = False) -> List[SeriesData
     return series_list
 
 
-def apply_scaling(series_list: List[SeriesData], split_end: int, scale_x: bool = True) -> FoldFitPreprocessor:
+def apply_scaling(
+    series_list: List[SeriesData],
+    split_end: int,
+    scale_x: bool = True,
+    scale_y: bool = True,
+) -> FoldFitPreprocessor:
     y_train = np.concatenate([s.y[:split_end] for s in series_list], axis=0)
     mask_train = np.concatenate(
         [
@@ -119,11 +135,14 @@ def apply_scaling(series_list: List[SeriesData], split_end: int, scale_x: bool =
         x_train = np.concatenate([s.x_past_feats[:split_end] for s in series_list], axis=0)
     else:
         scale_x = False
-    pre = FoldFitPreprocessor(scale_y=True, scale_x=scale_x)
+    pre = FoldFitPreprocessor(scale_y=scale_y, scale_x=scale_x)
     pre.fit(y_train, x_train=x_train, mask=mask_train)
     warned = False
     for series in series_list:
-        series.y = pre.y_scaler.transform(series.y)
+        if series.y_raw is None:
+            series.y_raw = series.y.copy()
+        if scale_y:
+            series.y = pre.y_scaler.transform(series.y)
         if scale_x and series.x_past_feats is not None:
             series.x_past_feats = pre.x_scaler.transform(series.x_past_feats)
             if series.x_future_feats is not None:
@@ -145,8 +164,11 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
     scales = [PatchScale(**scale) for scale in patch_cfg["scales"]]
     head_cfg = cfg.get("head", {})
     missing_cfg = cfg.get("missingness", {})
+    moe_cfg = cfg.get("moe", {})
     delta_t_mode = missing_cfg.get("delta_t_mode", missing_cfg.get("dt_embedding", "MLP_LOG1P"))
     summary_cfg = patch_cfg.get("summary", {})
+    gate_cfg = patch_cfg.get("gate", {})
+    scale_drop_cfg = patch_cfg.get("scale_drop", {})
     dir_head_cfg = cfg.get("direction_head", {})
     config = ModelConfig(
         L=data_cfg["L"],
@@ -161,8 +183,17 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         mlp_hidden=model_cfg["mlp_hidden"],
         dropout=model_cfg["dropout"],
         fusion=patch_cfg["fusion"],
-        gate_entropy_floor=patch_cfg.get("gate", {}).get("entropy_floor"),
-        gate_temperature=patch_cfg.get("gate", {}).get("temperature", 1.0),
+        gate_entropy_floor=gate_cfg.get("entropy_floor"),
+        gate_temperature=gate_cfg.get("temperature", 1.0),
+        gate_logit_clip=gate_cfg.get("logit_clip"),
+        gate_fixed_weight=gate_cfg.get("fixed_weight"),
+        gate_use_regime_features=bool(gate_cfg.get("use_regime_features", False)),
+        gate_regime_window=int(gate_cfg.get("regime_window", data_cfg.get("L", 240))),
+        gate_regime_eps=float(gate_cfg.get("regime_eps", 1e-6)),
+        gate_disable_coarse=bool(gate_cfg.get("disable_coarse", False)),
+        gate_disable_fine=bool(gate_cfg.get("disable_fine", False)),
+        scale_drop_coarse=float(scale_drop_cfg.get("drop_coarse_p", scale_drop_cfg.get("coarse", 0.0))),
+        scale_drop_fine=float(scale_drop_cfg.get("drop_fine_p", scale_drop_cfg.get("fine", 0.0))),
         dual_sum_weight=patch_cfg.get("dual_sum_weight", "equal"),
         decoder_mode=decoder_cfg.get("mode", "CA_ONLY"),
         cats_enabled=decoder_cfg.get("cats_masking", {}).get("enabled", True),
@@ -184,6 +215,15 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         dir_head_type=dir_head_cfg.get("type", "hierarchical"),
         dir_head_detach=dir_head_cfg.get("detach", False),
         dir_head_dropout=dir_head_cfg.get("dropout", 0.0),
+        moe_enabled=bool(moe_cfg.get("enabled", False)),
+        moe_gate_hidden=int(moe_cfg.get("gate_hidden", model_cfg.get("d_model", 256))),
+        moe_gate_temperature=float(moe_cfg.get("gate_temperature", 1.0)),
+        moe_gate_logit_clip=moe_cfg.get("gate_logit_clip"),
+        moe_gate_use_regime_features=bool(moe_cfg.get("use_regime_features", False)),
+        moe_gate_regime_window=int(moe_cfg.get("regime_window", data_cfg.get("L", 240))),
+        moe_gate_regime_eps=float(moe_cfg.get("regime_eps", 1e-6)),
+        moe_expert_drop_trend=float(moe_cfg.get("expert_drop_trend", 0.0)),
+        moe_expert_drop_mr=float(moe_cfg.get("expert_drop_mr", 0.0)),
     )
     return MultiScaleForecastModel(config, scales)
 
@@ -227,11 +267,15 @@ def collect_predictions(
     device: torch.device,
     diagnostics: bool = False,
     attn: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    return_meta: bool = False,
+    regime_window: int = 240,
+    regime_eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, dict | None]:
     y_list = []
     q_list = []
     dec_list = []
     attn_list = []
+    meta: Dict[str, List[np.ndarray]] = {}
     with torch.no_grad():
         for batch, target in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -247,6 +291,23 @@ def collect_predictions(
                     attn_list.append([a.cpu().numpy() for a in attn_val])
                 else:
                     attn_list.append(attn_val.cpu().numpy())
+            if return_meta:
+                feats = compute_regime_features_torch(
+                    batch["y_past"],
+                    batch.get("mask"),
+                    window=regime_window,
+                    eps=regime_eps,
+                )
+                for key, val in feats.items():
+                    meta.setdefault(key, []).append(val.detach().cpu().numpy())
+                if "gate_weights" in extras:
+                    meta.setdefault("gate_weights", []).append(extras["gate_weights"].detach().cpu().numpy())
+                if "gate_logits" in extras:
+                    meta.setdefault("gate_logits", []).append(extras["gate_logits"].detach().cpu().numpy())
+                if "moe_weights" in extras:
+                    meta.setdefault("moe_weights", []).append(extras["moe_weights"].detach().cpu().numpy())
+                if "moe_logits" in extras:
+                    meta.setdefault("moe_logits", []).append(extras["moe_logits"].detach().cpu().numpy())
     y = np.concatenate(y_list, axis=0)
     q = np.concatenate(q_list, axis=0)
     dec = np.concatenate(dec_list, axis=0) if dec_list else None
@@ -256,7 +317,26 @@ def collect_predictions(
         attn_arr = [np.concatenate([a[i] for a in attn_list], axis=0) for i in range(len(attn_list[0]))]
     else:
         attn_arr = np.concatenate(attn_list, axis=0)
-    return y, q, dec, attn_arr
+    meta_out = None
+    if return_meta:
+        meta_out = {k: np.concatenate(v, axis=0) for k, v in meta.items()}
+    return y, q, dec, attn_arr, meta_out
+
+
+def collect_regime_features(
+    loader: DataLoader,
+    device: torch.device,
+    window: int,
+    eps: float,
+) -> Dict[str, np.ndarray]:
+    feats: Dict[str, List[np.ndarray]] = {}
+    with torch.no_grad():
+        for batch, _ in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = compute_regime_features_torch(batch["y_past"], batch.get("mask"), window=window, eps=eps)
+            for key, val in out.items():
+                feats.setdefault(key, []).append(val.detach().cpu().numpy())
+    return {k: np.concatenate(v, axis=0) for k, v in feats.items()}
 
 
 def _monotonic_violations(q10: np.ndarray, q50: np.ndarray, q90: np.ndarray, eps: float = 1e-6) -> Dict[str, float]:
@@ -306,6 +386,130 @@ def directional_accuracy(
     return float(np.sum(correct) / max(denom, 1.0))
 
 
+def _num_patches(L: int, P: int, S: int) -> int:
+    if L < P:
+        return 0
+    return int((L - P) // S + 1)
+
+
+def compute_turning_delays(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    mask: np.ndarray,
+    ref: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    n, H = y_true.shape
+    dy_true = np.zeros_like(y_true)
+    dy_pred = np.zeros_like(y_pred)
+    dy_true[:, 0] = y_true[:, 0] - ref
+    dy_pred[:, 0] = y_pred[:, 0] - ref
+    if H > 1:
+        dy_true[:, 1:] = y_true[:, 1:] - y_true[:, :-1]
+        dy_pred[:, 1:] = y_pred[:, 1:] - y_pred[:, :-1]
+    true_turn = np.full(n, -1, dtype=np.int64)
+    pred_turn = np.full(n, -1, dtype=np.int64)
+    for i in range(n):
+        for h in range(1, H):
+            if mask[i, h] <= 0 or mask[i, h - 1] <= 0:
+                continue
+            s_prev = np.sign(dy_true[i, h - 1])
+            s_cur = np.sign(dy_true[i, h])
+            if true_turn[i] < 0 and s_prev != 0 and s_cur != 0 and s_cur != s_prev:
+                true_turn[i] = h + 1
+            s_prev_p = np.sign(dy_pred[i, h - 1])
+            s_cur_p = np.sign(dy_pred[i, h])
+            if pred_turn[i] < 0 and s_prev_p != 0 and s_cur_p != 0 and s_cur_p != s_prev_p:
+                pred_turn[i] = h + 1
+        if true_turn[i] >= 0 and pred_turn[i] < 0:
+            pred_turn[i] = H + 1
+    return true_turn, pred_turn
+
+
+def compute_regime_report(
+    eval_y: np.ndarray,
+    q50: np.ndarray,
+    q10: np.ndarray,
+    q90: np.ndarray,
+    mask: np.ndarray,
+    last_vals: np.ndarray,
+    regime_labels: np.ndarray,
+    target_mode: str,
+    no_trade_quantile: float = 0.8,
+    no_trade_min_count: int = 50,
+    attn_ratio: np.ndarray | None = None,
+) -> Dict[str, object]:
+    n, H = eval_y.shape
+    n_regimes = len(REGIME_NAMES)
+    width = q90 - q10
+    metrics: Dict[str, np.ndarray] = {}
+    for name in [
+        "mae",
+        "pinball50",
+        "dir_acc",
+        "drift_slope",
+        "turn_delay",
+        "pnl_proxy",
+        "turnover_proxy",
+    ]:
+        metrics[name] = np.full((n_regimes, H), np.nan, dtype=np.float32)
+    width_thr = np.full((n_regimes, H), np.nan, dtype=np.float32)
+    trade_mask = np.ones_like(mask, dtype=bool)
+    for r in range(n_regimes):
+        idx = regime_labels == r
+        if not np.any(idx):
+            continue
+        for h in range(H):
+            m = mask[idx, h] > 0
+            w = width[idx, h][m]
+            if w.size >= no_trade_min_count:
+                thr = float(np.quantile(w, no_trade_quantile))
+                width_thr[r, h] = thr
+                trade_mask[idx, h] = width[idx, h] <= thr
+
+    ref = np.zeros(n, dtype=np.float32) if target_mode != "level" else last_vals
+    true_turn, pred_turn = compute_turning_delays(eval_y, q50, mask, ref)
+    delay = np.full(n, np.nan, dtype=np.float32)
+    valid_turn = true_turn >= 0
+    delay[valid_turn] = np.maximum(pred_turn[valid_turn] - true_turn[valid_turn], 0).astype(np.float32)
+
+    for r in range(n_regimes):
+        idx = regime_labels == r
+        if not np.any(idx):
+            continue
+        for h in range(H):
+            m = mask[idx, h] > 0
+            if not np.any(m):
+                continue
+            y_true = eval_y[idx, h][m]
+            y_pred = q50[idx, h][m]
+            ref_h = ref[idx][m]
+            metrics["mae"][r, h] = float(np.mean(np.abs(y_true - y_pred)))
+            metrics["pinball50"][r, h] = float(np.mean(0.5 * np.abs(y_true - y_pred)))
+            true_dir = np.sign(y_true - ref_h)
+            pred_dir = np.sign(y_pred - ref_h)
+            metrics["dir_acc"][r, h] = float(np.mean(true_dir == pred_dir))
+            metrics["drift_slope"][r, h] = float(np.mean(np.abs((y_pred - ref_h) / float(h + 1))))
+            trade_m = trade_mask[idx, h][m]
+            if np.any(trade_m):
+                side = np.sign(y_pred[trade_m] - ref_h[trade_m])
+                pnl = side * (y_true[trade_m] - ref_h[trade_m])
+                metrics["pnl_proxy"][r, h] = float(np.mean(pnl))
+                metrics["turnover_proxy"][r, h] = float(np.mean(trade_m))
+            turn_h = true_turn[idx]
+            delay_h = delay[idx]
+            match = (turn_h == (h + 1)) & ~np.isnan(delay_h)
+            if np.any(match):
+                metrics["turn_delay"][r, h] = float(np.mean(delay_h[match]))
+    report: Dict[str, object] = {
+        "regime_names": REGIME_NAMES,
+        "metrics": metrics,
+        "width_thresholds": width_thr,
+    }
+    if attn_ratio is not None:
+        report["attr_ratio_coarse"] = attn_ratio
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -347,6 +551,10 @@ def main() -> None:
     cfg = load_config(args.config)
     seed = cfg.get("training", {}).get("seed", 7)
     set_seed(seed)
+    regime_cfg = cfg.get("evaluation", {}).get("regime", {})
+    regime_enabled = bool(regime_cfg.get("enabled", True))
+    regime_window = int(regime_cfg.get("window", cfg["data"]["L"]))
+    regime_eps = float(regime_cfg.get("eps", 1e-6))
 
     series_list = build_series_list(cfg["data"]["path"], observed_only=cfg["data"].get("observed_only", False))
     lengths = [len(s.y) for s in series_list]
@@ -365,15 +573,55 @@ def main() -> None:
     horizon = cfg["data"]["H"]
     val_idx = select_indices_by_time(indices, split, "val", horizon=horizon, purge=split_purge, embargo=split_embargo)
     test_idx = select_indices_by_time(indices, split, "test", horizon=horizon, purge=split_purge, embargo=split_embargo)
+    train_idx = None
+    if regime_enabled:
+        train_idx = select_indices_by_time(
+            indices,
+            split,
+            "train",
+            horizon=horizon,
+            purge=split_purge,
+            embargo=split_embargo,
+        )
 
-    pre = apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    pre = apply_scaling(
+        series_list,
+        split.train_end,
+        scale_x=cfg["data"].get("scale_x", True),
+        scale_y=cfg["data"].get("scale_y", True),
+    )
     min_past_obs = cfg["data"].get("min_past_obs", 1)
     min_future_obs = cfg["data"].get("min_future_obs", 1)
     val_idx = filter_indices_with_observed(series_list, val_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs)
     test_idx = filter_indices_with_observed(series_list, test_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs)
+    if regime_enabled and train_idx is not None:
+        train_idx = filter_indices_with_observed(
+            series_list,
+            train_idx,
+            cfg["data"]["L"],
+            cfg["data"]["H"],
+            min_past_obs,
+            min_future_obs,
+        )
 
-    val_ds_base = WindowedDataset(series_list, val_idx, cfg["data"]["L"], cfg["data"]["H"])
-    test_ds_base = WindowedDataset(series_list, test_idx, cfg["data"]["L"], cfg["data"]["H"])
+    target_mode = cfg["data"].get("target_mode", "level")
+    target_log_eps = float(cfg["data"].get("target_log_eps", 1e-6))
+    val_ds_base = WindowedDataset(
+        series_list,
+        val_idx,
+        cfg["data"]["L"],
+        cfg["data"]["H"],
+        target_mode=target_mode,
+        target_log_eps=target_log_eps,
+    )
+    test_ds_base = WindowedDataset(
+        series_list,
+        test_idx,
+        cfg["data"]["L"],
+        cfg["data"]["H"],
+        target_mode=target_mode,
+        target_log_eps=target_log_eps,
+    )
     apply_missingness = args.missingness_pattern != "none"
     miss_cfg = None
     if apply_missingness:
@@ -396,6 +644,17 @@ def main() -> None:
         calib_loader = DataLoader(MissingnessDataset(val_ds_base, miss_cfg), batch_size=batch_size)
     else:
         calib_loader = DataLoader(val_ds_base, batch_size=batch_size)
+    train_loader = None
+    if regime_enabled and train_idx:
+        train_ds = WindowedDataset(
+            series_list,
+            train_idx,
+            cfg["data"]["L"],
+            cfg["data"]["H"],
+            target_mode=target_mode,
+            target_log_eps=target_log_eps,
+        )
+        train_loader = DataLoader(train_ds, batch_size=batch_size)
 
     model = build_model(cfg)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
@@ -403,6 +662,17 @@ def main() -> None:
     device = torch.device(cfg["training"].get("device", "cpu"))
     model.to(device)
     model.eval()
+    regime_thresholds = None
+    if regime_enabled and train_loader is not None:
+        train_feats = collect_regime_features(train_loader, device, regime_window, regime_eps)
+        regime_thresholds = fit_regime_thresholds(
+            train_feats,
+            trend_q=float(regime_cfg.get("trend_q", 0.7)),
+            mr_q=float(regime_cfg.get("mr_q", 0.3)),
+            vol_q=float(regime_cfg.get("vol_q", 0.7)),
+            chop_q=float(regime_cfg.get("chop_q", 0.7)),
+            jump_q=float(regime_cfg.get("jump_q", 0.9)),
+        )
 
     quantiles = cfg["data"]["quantiles"]
     q10_idx = quantiles.index(0.1)
@@ -428,7 +698,7 @@ def main() -> None:
 
     calibrator = None
     if use_cqr:
-        val_y, val_q, _, _ = collect_predictions(model, calib_loader, device)
+        val_y, val_q, _, _, _ = collect_predictions(model, calib_loader, device)
         val_q10 = val_q[..., q10_idx]
         val_q90 = val_q[..., q90_idx]
         cal_cfg = cfg.get("calibration", {}).get("cqr", {})
@@ -436,12 +706,16 @@ def main() -> None:
         calibrator = CQRCalibrator(alpha=0.1, per_horizon=per_h)
         calibrator.fit(val_q10, val_q90, val_y)
 
-    eval_y, eval_q, dec_out, attn = collect_predictions(
+    need_meta = regime_enabled or diagnostics
+    eval_y, eval_q, dec_out, attn, meta = collect_predictions(
         model,
         eval_loader,
         device,
         diagnostics=diagnostics,
         attn=attn_diag,
+        return_meta=need_meta,
+        regime_window=regime_window,
+        regime_eps=regime_eps,
     )
     base_last, base_seasonal, base_last_mask = collect_baselines(eval_loader, device)
     eval_q = np.nan_to_num(eval_q, nan=0.0)
@@ -535,20 +809,45 @@ def main() -> None:
 
     mask = np.isfinite(eval_y).astype(np.float32)
     eval_y = np.nan_to_num(eval_y, nan=0.0)
+    regime_labels = None
+    if regime_enabled and meta is not None:
+        eval_feats = {k: meta[k] for k in ["trend_t", "autocorr", "vol", "chop", "jump"] if k in meta}
+        if regime_thresholds is None:
+            regime_thresholds = fit_regime_thresholds(
+                eval_feats,
+                trend_q=float(regime_cfg.get("trend_q", 0.7)),
+                mr_q=float(regime_cfg.get("mr_q", 0.3)),
+                vol_q=float(regime_cfg.get("vol_q", 0.7)),
+                chop_q=float(regime_cfg.get("chop_q", 0.7)),
+                jump_q=float(regime_cfg.get("jump_q", 0.9)),
+            )
+        regime_labels = label_regimes(eval_feats, regime_thresholds)
     last_mask = base_last_mask.reshape(-1, 1).astype(np.float32)
-    mask_dir = mask * last_mask
-    if pre is not None:
-        eval_y_orig = pre.inverse_y(eval_y)
-        q50_orig = pre.inverse_y(q50)
-        last_orig = pre.inverse_y(base_last)
-        seasonal_orig = pre.inverse_y(base_seasonal)
+    mask_dir = mask * last_mask if target_mode == "level" else mask
+    if target_mode == "level":
+        if pre is not None:
+            eval_y_orig = pre.inverse_y(eval_y)
+            q50_orig = pre.inverse_y(q50)
+            last_orig = pre.inverse_y(base_last)
+            seasonal_orig = pre.inverse_y(base_seasonal)
+        else:
+            eval_y_orig = eval_y
+            q50_orig = q50
+            last_orig = base_last
+            seasonal_orig = base_seasonal
+        last_pred = np.repeat(last_orig[:, None], eval_y_orig.shape[1], axis=1)
+        seasonal_pred = np.repeat(seasonal_orig[:, None], eval_y_orig.shape[1], axis=1)
     else:
-        eval_y_orig = eval_y
-        q50_orig = q50
-        last_orig = base_last
-        seasonal_orig = base_seasonal
-    last_pred = np.repeat(last_orig[:, None], eval_y_orig.shape[1], axis=1)
-    seasonal_pred = np.repeat(seasonal_orig[:, None], eval_y_orig.shape[1], axis=1)
+        if pre is not None:
+            eval_y_orig = pre.inverse_return(eval_y)
+            q50_orig = pre.inverse_return(q50)
+        else:
+            eval_y_orig = eval_y
+            q50_orig = q50
+        last_orig = np.zeros_like(base_last)
+        seasonal_orig = np.zeros_like(base_seasonal)
+        last_pred = np.zeros_like(eval_y_orig)
+        seasonal_pred = np.zeros_like(eval_y_orig)
     metrics = {
         "mae": masked_mae(eval_y, q50, mask),
         "rmse": masked_rmse(eval_y, q50, mask),
@@ -617,11 +916,100 @@ def main() -> None:
         metrics["coverage_traj"] = float(np.mean(np.all(inside[mask_full], axis=1)))
     else:
         metrics["coverage_traj"] = float("nan")
+    regime_report = None
+    if regime_enabled and regime_labels is not None:
+        no_trade_cfg = regime_cfg.get("no_trade", {})
+        no_trade_quantile = float(no_trade_cfg.get("width_quantile", 0.8))
+        no_trade_min = int(no_trade_cfg.get("min_count", 50))
+        attn_ratio = None
+        if attn_diag and attn is not None and cfg["patching"].get("fusion") == "TWO_ENCODERS_GATED":
+            if not isinstance(attn, list):
+                scales_cfg = cfg["patching"]["scales"]
+                fine_cfg = next(s for s in scales_cfg if s["name"] == "fine")
+                coarse_cfg = next(s for s in scales_cfg if s["name"] == "coarse")
+                n_f = _num_patches(cfg["data"]["L"], fine_cfg["P"], fine_cfg["S"])
+                n_c = _num_patches(cfg["data"]["L"], coarse_cfg["P"], coarse_cfg["S"])
+                if cfg["patching"].get("summary", {}).get("enabled", False):
+                    n_f += 1
+                    n_c += 1
+                attn_mean = attn.mean(axis=1)
+                total = np.sum(attn_mean, axis=-1)
+                coarse_sum = np.sum(attn_mean[..., n_f : n_f + n_c], axis=-1)
+                ratio = coarse_sum / (total + 1e-8)
+                attn_ratio = np.full((len(REGIME_NAMES), eval_y.shape[1]), np.nan, dtype=np.float32)
+                for r in range(len(REGIME_NAMES)):
+                    idx = regime_labels == r
+                    if np.any(idx):
+                        attn_ratio[r] = np.mean(ratio[idx], axis=0).astype(np.float32)
+        regime_report = compute_regime_report(
+            eval_y,
+            q50,
+            q10,
+            q90,
+            mask,
+            base_last,
+            regime_labels,
+            target_mode,
+            no_trade_quantile=no_trade_quantile,
+            no_trade_min_count=no_trade_min,
+            attn_ratio=attn_ratio,
+        )
+        if regime_thresholds is not None:
+            regime_report["thresholds"] = regime_thresholds.as_dict()
+        if meta is not None and "gate_logits" in meta:
+            logit_diff = meta["gate_logits"][:, 1] - meta["gate_logits"][:, 0]
+            bins = np.linspace(float(np.nanmin(logit_diff)), float(np.nanmax(logit_diff)), num=21)
+            hist = np.zeros((len(REGIME_NAMES), bins.size - 1), dtype=np.float32)
+            for r in range(len(REGIME_NAMES)):
+                idx = regime_labels == r
+                if np.any(idx):
+                    hist[r] = np.histogram(logit_diff[idx], bins=bins)[0].astype(np.float32)
+            regime_report["gate_logit_hist"] = hist
+            regime_report["gate_logit_bins"] = bins.astype(np.float32)
+        if meta is not None and "gate_weights" in meta:
+            gate_w = meta["gate_weights"][:, 1]
+            gate_mean = np.full(len(REGIME_NAMES), np.nan, dtype=np.float32)
+            for r in range(len(REGIME_NAMES)):
+                idx = regime_labels == r
+                if np.any(idx):
+                    gate_mean[r] = float(np.mean(gate_w[idx]))
+            regime_report["gate_weight_mean"] = gate_mean
+        if meta is not None and "moe_weights" in meta:
+            moe_w = meta["moe_weights"][:, 0]
+            moe_mean = np.full(len(REGIME_NAMES), np.nan, dtype=np.float32)
+            for r in range(len(REGIME_NAMES)):
+                idx = regime_labels == r
+                if np.any(idx):
+                    moe_mean[r] = float(np.mean(moe_w[idx]))
+            regime_report["moe_trend_weight_mean"] = moe_mean
+        if meta is not None and "moe_logits" in meta:
+            logit_diff = meta["moe_logits"][:, 0] - meta["moe_logits"][:, 1]
+            bins = np.linspace(float(np.nanmin(logit_diff)), float(np.nanmax(logit_diff)), num=21)
+            hist = np.zeros((len(REGIME_NAMES), bins.size - 1), dtype=np.float32)
+            for r in range(len(REGIME_NAMES)):
+                idx = regime_labels == r
+                if np.any(idx):
+                    hist[r] = np.histogram(logit_diff[idx], bins=bins)[0].astype(np.float32)
+            regime_report["moe_logit_hist"] = hist
+            regime_report["moe_logit_bins"] = bins.astype(np.float32)
+        h24 = min(eval_y.shape[1] - 1, 23)
+        reg_summary = {}
+        for r, name in enumerate(REGIME_NAMES):
+            reg_summary[name] = {
+                "mae": float(regime_report["metrics"]["mae"][r, h24]),
+                "dir_acc": float(regime_report["metrics"]["dir_acc"][r, h24]),
+                "pnl_proxy": float(regime_report["metrics"]["pnl_proxy"][r, h24]),
+                "turnover": float(regime_report["metrics"]["turnover_proxy"][r, h24]),
+            }
+        print("regime_h24", reg_summary)
     output_path = Path(cfg.get("evaluation", {}).get("output_path", "metrics.npz"))
     if args.metrics_out:
         output_path = Path(args.metrics_out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(output_path, metrics=metrics, horizon=horizon)
+    if regime_report is not None:
+        np.savez(output_path, metrics=metrics, horizon=horizon, regime_report=regime_report)
+    else:
+        np.savez(output_path, metrics=metrics, horizon=horizon)
     print(metrics)
 
     if args.out_npz:
@@ -629,6 +1017,8 @@ def main() -> None:
         out_npz.parent.mkdir(parents=True, exist_ok=True)
         save_indices = parse_bool(args.save_indices)
         npz_kwargs = {"y": eval_y, "q10": q10, "q50": q50, "q90": q90, "mask": mask}
+        if regime_labels is not None:
+            npz_kwargs["regime"] = regime_labels
         if save_indices:
             ds = eval_loader.dataset
             indices = None

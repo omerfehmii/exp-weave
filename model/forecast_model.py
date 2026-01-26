@@ -13,6 +13,7 @@ from .fusion import GateConfig, GatedFusion
 from .head import DualPathQuantileHead, FreeQuantileHead, LSQQuantileHead, MonotoneQuantileHead
 from .missingness import make_token_key_padding_mask
 from .patching import MultiScalePatcher, PatchScale
+from regime import make_gate_features
 
 
 @dataclass
@@ -31,6 +32,24 @@ class ModelConfig:
     fusion: str = "TWO_ENCODERS_GATED"  # or JOINT_TOKENS, DUAL_SUM, TWO_ENCODERS_CONCAT
     gate_entropy_floor: Optional[float] = None
     gate_temperature: float = 1.0
+    gate_logit_clip: Optional[float] = None
+    gate_fixed_weight: Optional[float] = None
+    gate_use_regime_features: bool = False
+    gate_regime_window: int = 240
+    gate_regime_eps: float = 1e-6
+    gate_disable_coarse: bool = False
+    gate_disable_fine: bool = False
+    scale_drop_coarse: float = 0.0
+    scale_drop_fine: float = 0.0
+    moe_enabled: bool = False
+    moe_gate_hidden: int = 256
+    moe_gate_temperature: float = 1.0
+    moe_gate_logit_clip: Optional[float] = None
+    moe_gate_use_regime_features: bool = False
+    moe_gate_regime_window: int = 240
+    moe_gate_regime_eps: float = 1e-6
+    moe_expert_drop_trend: float = 0.0
+    moe_expert_drop_mr: float = 0.0
     dual_sum_weight: str = "equal"  # or token
     decoder_mode: str = "CA_ONLY"
     cats_enabled: bool = True
@@ -91,7 +110,14 @@ class MultiScaleForecastModel(nn.Module):
             self.encoder_fine = TransformerEncoder(enc_cfg)
             self.encoder_coarse = TransformerEncoder(enc_cfg)
             if cfg.fusion == "TWO_ENCODERS_GATED":
-                gate_cfg = GateConfig(entropy_floor=cfg.gate_entropy_floor, temperature=cfg.gate_temperature)
+                extra_dim = 4 if cfg.gate_use_regime_features else 0
+                gate_cfg = GateConfig(
+                    entropy_floor=cfg.gate_entropy_floor,
+                    temperature=cfg.gate_temperature,
+                    extra_dim=extra_dim,
+                    fixed_weight=cfg.gate_fixed_weight,
+                    logit_clip=cfg.gate_logit_clip,
+                )
                 self.gate = GatedFusion(cfg.d_model, cfg.d_model, gate_cfg)
             else:
                 self.gate = None
@@ -111,16 +137,29 @@ class MultiScaleForecastModel(nn.Module):
             mode=cfg.decoder_mode,
         )
         self.decoder = ForecastDecoder(cfg.H, cfg.d_model, cfg.future_feat_dim, dec_cfg, cats_cfg)
-        if cfg.head_type == "MONO":
-            self.head = MonotoneQuantileHead(cfg.d_model, cfg.quantiles, delta_floor=cfg.head_delta_floor)
-        elif cfg.head_type == "DUAL_PATH":
-            self.head = DualPathQuantileHead(cfg.d_model, cfg.quantiles, delta_floor=cfg.head_delta_floor)
-        elif cfg.head_type == "LSQ":
-            self.head = LSQQuantileHead(cfg.d_model, cfg.quantiles, s_min=cfg.head_lsq_s_min)
-        elif cfg.head_type == "FREE":
-            self.head = FreeQuantileHead(cfg.d_model, cfg.quantiles)
-        else:
+        def _build_head() -> nn.Module:
+            if cfg.head_type == "MONO":
+                return MonotoneQuantileHead(cfg.d_model, cfg.quantiles, delta_floor=cfg.head_delta_floor)
+            if cfg.head_type == "DUAL_PATH":
+                return DualPathQuantileHead(cfg.d_model, cfg.quantiles, delta_floor=cfg.head_delta_floor)
+            if cfg.head_type == "LSQ":
+                return LSQQuantileHead(cfg.d_model, cfg.quantiles, s_min=cfg.head_lsq_s_min)
+            if cfg.head_type == "FREE":
+                return FreeQuantileHead(cfg.d_model, cfg.quantiles)
             raise ValueError(f"Unknown head type: {cfg.head_type}")
+
+        if cfg.moe_enabled:
+            self.expert_heads = nn.ModuleList([_build_head(), _build_head()])
+            gate_in_dim = cfg.d_model + (4 if cfg.moe_gate_use_regime_features else 0)
+            self.moe_gate = nn.Sequential(
+                nn.Linear(gate_in_dim, cfg.moe_gate_hidden),
+                nn.ReLU(),
+                nn.Linear(cfg.moe_gate_hidden, 2),
+            )
+        else:
+            self.expert_heads = None
+            self.moe_gate = None
+            self.head = _build_head()
         self.dir_head_enabled = cfg.dir_head_enabled
         if self.dir_head_enabled:
             self.dir_dropout = nn.Dropout(cfg.dir_head_dropout) if cfg.dir_head_dropout > 0 else None
@@ -181,8 +220,48 @@ class MultiScaleForecastModel(nn.Module):
                 raise ValueError("Multi-scale fusion requires scales named 'fine' and 'coarse'.")
             mem_f = self.encoder_fine(tokens["fine"], key_padding_mask=_maybe_mask(token_masks["fine"]))
             mem_c = self.encoder_coarse(tokens["coarse"], key_padding_mask=_maybe_mask(token_masks["coarse"]))
+            if self.cfg.gate_disable_coarse:
+                mem_c = mem_c.clone()
+                mem_c[:] = 0.0
+                token_masks["coarse"] = token_masks["coarse"].clone()
+                token_masks["coarse"][:] = 0.0
+            if self.cfg.gate_disable_fine:
+                mem_f = mem_f.clone()
+                mem_f[:] = 0.0
+                token_masks["fine"] = token_masks["fine"].clone()
+                token_masks["fine"][:] = 0.0
+            if self.training and (self.cfg.scale_drop_coarse > 0 or self.cfg.scale_drop_fine > 0):
+                p_coarse = max(0.0, float(self.cfg.scale_drop_coarse))
+                p_fine = max(0.0, float(self.cfg.scale_drop_fine))
+                p_total = min(p_coarse + p_fine, 1.0)
+                if p_total > 0:
+                    draw = torch.rand((mem_f.shape[0], 1), device=mem_f.device)
+                    drop_coarse = draw < p_coarse
+                    drop_fine = (draw >= p_coarse) & (draw < p_total)
+                    if drop_coarse.any():
+                        mem_c = mem_c.clone()
+                        mem_c[drop_coarse.squeeze(-1)] = 0.0
+                        token_masks["coarse"] = token_masks["coarse"].clone()
+                        token_masks["coarse"][drop_coarse.squeeze(-1)] = 0.0
+                    if drop_fine.any():
+                        mem_f = mem_f.clone()
+                        mem_f[drop_fine.squeeze(-1)] = 0.0
+                        token_masks["fine"] = token_masks["fine"].clone()
+                        token_masks["fine"][drop_fine.squeeze(-1)] = 0.0
             if self.fusion == "TWO_ENCODERS_GATED":
-                mem, weights = self.gate(mem_f, mem_c)
+                gate_extra = None
+                if self.cfg.gate_use_regime_features:
+                    gate_extra = make_gate_features(
+                        y_past,
+                        mask,
+                        window=self.cfg.gate_regime_window,
+                        eps=self.cfg.gate_regime_eps,
+                    )
+                if return_diagnostics:
+                    mem, weights, logits = self.gate(mem_f, mem_c, extra=gate_extra, return_logits=True)
+                    extras["gate_logits"] = logits
+                else:
+                    mem, weights = self.gate(mem_f, mem_c, extra=gate_extra, return_logits=False)
                 mem_mask = torch.cat([token_masks["fine"], token_masks["coarse"]], dim=1)
                 extras["gate_weights"] = weights
             elif self.fusion == "TWO_ENCODERS_CONCAT":
@@ -227,7 +306,15 @@ class MultiScaleForecastModel(nn.Module):
                 cats_enabled_override=self.cfg.dual_path_uncertainty_cats,
                 return_attn=False,
             )
-            q_hat = self.head(dec_masked, dec_uncert)
+            if self.cfg.moe_enabled:
+                q_list = []
+                for head in self.expert_heads or []:
+                    q_list.append(head(dec_masked, dec_uncert))
+                q_hat, moe_weights, moe_logits = self._apply_moe(dec_masked, q_list, y_past, mask)
+                extras["moe_weights"] = moe_weights
+                extras["moe_logits"] = moe_logits
+            else:
+                q_hat = self.head(dec_masked, dec_uncert)
             if return_diagnostics:
                 extras["dec_out"] = dec_masked
                 extras["dec_out_uncert"] = dec_uncert
@@ -241,7 +328,15 @@ class MultiScaleForecastModel(nn.Module):
                 mem_weights=mem_weights,
                 return_attn=return_attn,
             )
-            q_hat = self.head(dec_out)
+            if self.cfg.moe_enabled:
+                q_list = []
+                for head in self.expert_heads or []:
+                    q_list.append(head(dec_out))
+                q_hat, moe_weights, moe_logits = self._apply_moe(dec_out, q_list, y_past, mask)
+                extras["moe_weights"] = moe_weights
+                extras["moe_logits"] = moe_logits
+            else:
+                q_hat = self.head(dec_out)
             if return_diagnostics:
                 extras["dec_out"] = dec_out
         if self.dir_head_enabled:
@@ -260,3 +355,51 @@ class MultiScaleForecastModel(nn.Module):
         if return_attn and attn is not None:
             extras["attn"] = attn
         return q_hat, extras
+
+    def _apply_moe(
+        self,
+        gate_source: torch.Tensor,
+        q_list: List[torch.Tensor],
+        y_past: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.moe_gate is None:
+            raise RuntimeError("moe_gate is not initialized.")
+        if not q_list:
+            raise RuntimeError("moe_enabled but no expert outputs.")
+        pooled = gate_source.mean(dim=1)
+        gate_in = pooled
+        if self.cfg.moe_gate_use_regime_features:
+            gate_feats = make_gate_features(
+                y_past,
+                mask,
+                window=self.cfg.moe_gate_regime_window,
+                eps=self.cfg.moe_gate_regime_eps,
+            )
+            gate_in = torch.cat([gate_in, gate_feats], dim=-1)
+        logits = self.moe_gate(gate_in) / self.cfg.moe_gate_temperature
+        if self.cfg.moe_gate_logit_clip is not None:
+            clip = float(self.cfg.moe_gate_logit_clip)
+            logits = torch.clamp(logits, -clip, clip)
+        weights = torch.softmax(logits, dim=-1)
+        if self.training and (self.cfg.moe_expert_drop_trend > 0 or self.cfg.moe_expert_drop_mr > 0):
+            p_t = max(0.0, float(self.cfg.moe_expert_drop_trend))
+            p_m = max(0.0, float(self.cfg.moe_expert_drop_mr))
+            p_total = min(p_t + p_m, 1.0)
+            if p_total > 0:
+                draw = torch.rand((weights.shape[0], 1), device=weights.device)
+                drop_trend = draw < p_t
+                drop_mr = (draw >= p_t) & (draw < p_total)
+                if drop_trend.any():
+                    weights = weights.clone()
+                    weights[drop_trend.squeeze(-1), 0] = 0.0
+                    weights[drop_trend.squeeze(-1), 1] = 1.0
+                if drop_mr.any():
+                    weights = weights.clone()
+                    weights[drop_mr.squeeze(-1), 0] = 1.0
+                    weights[drop_mr.squeeze(-1), 1] = 0.0
+        q_hat = torch.zeros_like(q_list[0])
+        for idx, q in enumerate(q_list):
+            w = weights[:, idx].view(-1, 1, 1)
+            q_hat = q_hat + q * w
+        return q_hat, weights, logits

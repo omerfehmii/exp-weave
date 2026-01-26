@@ -60,10 +60,24 @@ def main() -> None:
     # apply same scaling as classifier config
     lengths = [len(s.y) for s in series_list]
     train_end = int(min(lengths) * cfg_cls["data"].get("train_frac", 0.7))
-    apply_scaling(series_list, train_end, scale_x=cfg_cls["data"].get("scale_x", True))
+    apply_scaling(
+        series_list,
+        train_end,
+        scale_x=cfg_cls["data"].get("scale_x", True),
+        scale_y=cfg_cls["data"].get("scale_y", True),
+    )
 
     indices = list(zip(series_idx.tolist(), origin_t.tolist()))
-    ds = WindowedDataset(series_list, indices, cfg_cls["data"]["L"], cfg_cls["data"]["H"])
+    target_mode = cfg_cls["data"].get("target_mode", "level")
+    target_log_eps = float(cfg_cls["data"].get("target_log_eps", 1e-6))
+    ds = WindowedDataset(
+        series_list,
+        indices,
+        cfg_cls["data"]["L"],
+        cfg_cls["data"]["H"],
+        target_mode=target_mode,
+        target_log_eps=target_log_eps,
+    )
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
     device = torch.device(cfg_cls.get("training", {}).get("device", "cpu"))

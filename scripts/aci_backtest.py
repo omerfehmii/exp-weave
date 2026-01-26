@@ -17,6 +17,7 @@ from backtest.harness import generate_panel_origins, make_time_splits, select_in
 from data.loader import load_panel_npz, compress_series_observed
 from train import filter_indices_with_observed
 from utils import load_config
+from regime import REGIME_NAMES, RegimeThresholds, compute_regime_features_np, fit_regime_thresholds, label_regimes
 
 
 def _hour_of_day(timestamps: np.ndarray, t: int) -> int:
@@ -70,6 +71,51 @@ def _compute_vol_thresholds(cfg: dict, series_list: list, vol_bins: int) -> List
     qs = [i / vol_bins for i in range(1, vol_bins)]
     thresholds = np.quantile(np.asarray(vols, dtype=np.float32), qs).tolist()
     return [float(x) for x in thresholds]
+
+
+def _compute_regime_thresholds(cfg: dict, series_list: list, regime_cfg: dict) -> tuple[dict, dict]:
+    regime_window = int(regime_cfg.get("window", cfg["data"]["L"]))
+    regime_eps = float(regime_cfg.get("eps", 1e-6))
+    lengths = [len(s.y) for s in series_list]
+    split = make_time_splits(min(lengths), cfg["data"].get("train_frac", 0.7), cfg["data"].get("val_frac", 0.15))
+    split_purge = int(cfg["data"].get("split_purge", 0))
+    split_embargo = int(cfg["data"].get("split_embargo", 0))
+    indices = generate_panel_origins(lengths, cfg["data"]["L"], cfg["data"]["H"], cfg["data"].get("step", cfg["data"]["H"]))
+    horizon = cfg["data"]["H"]
+    train_idx = select_indices_by_time(indices, split, "train", horizon=horizon, purge=split_purge, embargo=split_embargo)
+    train_idx = filter_indices_with_observed(
+        series_list,
+        train_idx,
+        cfg["data"]["L"],
+        cfg["data"]["H"],
+        cfg["data"].get("min_past_obs", 1),
+        cfg["data"].get("min_future_obs", 1),
+    )
+    feats: Dict[str, List[float]] = {"trend_t": [], "autocorr": [], "vol": [], "chop": [], "jump": []}
+    L = cfg["data"]["L"]
+    for s_idx, t in train_idx:
+        s = series_list[s_idx]
+        y = s.y
+        if y.ndim > 1:
+            y = y[:, 0]
+        mask = s.mask
+        if mask is not None and mask.ndim > 1:
+            mask = mask[:, 0]
+        y_past = y[t - L + 1 : t + 1]
+        mask_past = None if mask is None else mask[t - L + 1 : t + 1]
+        out = compute_regime_features_np(y_past[None, :], None if mask_past is None else mask_past[None, :], window=regime_window, eps=regime_eps)
+        for key in feats:
+            feats[key].append(float(out[key][0]))
+    features = {k: np.asarray(v, dtype=np.float32) for k, v in feats.items()}
+    thresholds = fit_regime_thresholds(
+        features,
+        trend_q=float(regime_cfg.get("trend_q", 0.7)),
+        mr_q=float(regime_cfg.get("mr_q", 0.3)),
+        vol_q=float(regime_cfg.get("vol_q", 0.7)),
+        chop_q=float(regime_cfg.get("chop_q", 0.7)),
+        jump_q=float(regime_cfg.get("jump_q", 0.9)),
+    )
+    return thresholds.as_dict(), {"window": regime_window, "eps": regime_eps}
 
 
 def _vol_regime(vol: float, thresholds: List[float]) -> int:
@@ -132,6 +178,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    regime_cfg = cfg.get("evaluation", {}).get("regime", {})
+    regime_enabled = bool(regime_cfg.get("enabled", True))
     preds = np.load(args.preds)
     y = preds["y"]
     q10 = preds["q10"]
@@ -159,6 +207,10 @@ def main() -> None:
     for s in series_list:
         s.ensure_features()
     vol_thresholds = _compute_vol_thresholds(cfg, series_list, args.vol_bins)
+    regime_thresholds = None
+    regime_meta: Dict[str, float] | None = None
+    if regime_enabled:
+        regime_thresholds, regime_meta = _compute_regime_thresholds(cfg, series_list, regime_cfg)
     if args.state_in:
         alpha_in, buffer_in, vol_thr_in, last_t, cfg_in = load_state(args.state_in)
         if alpha_in:
@@ -197,6 +249,31 @@ def main() -> None:
         origin_t = origin_t[keep]
         series_idx = series_idx[keep]
 
+    regime_labels = None
+    if regime_enabled and regime_thresholds is not None:
+        L = cfg["data"]["L"]
+        feats = {k: np.zeros(origin_t.shape[0], dtype=np.float32) for k in ["trend_t", "autocorr", "vol", "chop", "jump"]}
+        for i, (s_idx, t) in enumerate(zip(series_idx, origin_t)):
+            s = series_list[int(s_idx)]
+            y_series = s.y
+            if y_series.ndim > 1:
+                y_series = y_series[:, 0]
+            mask_series = s.mask
+            if mask_series is not None and mask_series.ndim > 1:
+                mask_series = mask_series[:, 0]
+            y_past = y_series[int(t) - L + 1 : int(t) + 1]
+            mask_past = None if mask_series is None else mask_series[int(t) - L + 1 : int(t) + 1]
+            out = compute_regime_features_np(
+                y_past[None, :],
+                None if mask_past is None else mask_past[None, :],
+                window=int(regime_meta.get("window", L)) if regime_meta else L,
+                eps=float(regime_meta.get("eps", 1e-6)) if regime_meta else 1e-6,
+            )
+            for key in feats:
+                feats[key][i] = float(out[key][0])
+        thr = RegimeThresholds(**regime_thresholds)
+        regime_labels = label_regimes(feats, thr)
+
     # Precompute buckets per sample
     buckets: List[Tuple[int | None, int | None]] = []
     for idx, (s_idx, t) in enumerate(zip(series_idx, origin_t)):
@@ -225,6 +302,7 @@ def main() -> None:
     residual_by_time: Dict[int, List[Tuple[int, Tuple[int | None, int | None], float]]] = defaultdict(list)
     q10_cal = q10.copy()
     q90_cal = q90.copy()
+    alpha_used = np.full_like(mask, np.nan, dtype=np.float32)
     retro_refresh = _parse_bool(args.retro_refresh)
     switch_prob = _parse_bool(args.switch_prob)
     ema_fast = np.zeros(H, dtype=np.float32)
@@ -275,6 +353,7 @@ def main() -> None:
             for h in range(H):
                 if mask[idx, h] <= 0:
                     continue
+                alpha_used[idx, h] = alpha[h]
                 s = buffer.get_scale(h, bucket, float(alpha[h]), fallback_bucket, global_bucket)
                 if switch_prob:
                     denom = abs(float(ema_slow[h])) + args.switch_eps
@@ -326,13 +405,70 @@ def main() -> None:
         "coverage90_min": cov_min,
         "alpha_target": alpha_target,
     }
+    regime_report = None
+    if regime_labels is not None:
+        n_reg = len(REGIME_NAMES)
+        cov_pre = np.full((n_reg, H), np.nan, dtype=np.float32)
+        cov_post = np.full((n_reg, H), np.nan, dtype=np.float32)
+        width_pre = np.full((n_reg, H), np.nan, dtype=np.float32)
+        width_post = np.full((n_reg, H), np.nan, dtype=np.float32)
+        med_err = np.full((n_reg, H), np.nan, dtype=np.float32)
+        alpha_std = np.full((n_reg, H), np.nan, dtype=np.float32)
+        width_std = np.full((n_reg, H), np.nan, dtype=np.float32)
+        for r in range(n_reg):
+            idx = regime_labels == r
+            if not np.any(idx):
+                continue
+            for h in range(H):
+                m = mask[idx, h] > 0
+                if not np.any(m):
+                    continue
+                y_h = y[idx, h][m]
+                q10_h = q10[idx, h][m]
+                q90_h = q90[idx, h][m]
+                q10c_h = q10_cal[idx, h][m]
+                q90c_h = q90_cal[idx, h][m]
+                cov_pre[r, h] = float(np.mean((y_h >= q10_h) & (y_h <= q90_h)))
+                cov_post[r, h] = float(np.mean((y_h >= q10c_h) & (y_h <= q90c_h)))
+                width_pre[r, h] = float(np.mean(q90_h - q10_h))
+                width_post[r, h] = float(np.mean(q90c_h - q10c_h))
+                med_err[r, h] = float(np.median(np.abs(y_h - q50[idx, h][m])))
+                alpha_std[r, h] = float(np.nanstd(alpha_used[idx, h][m]))
+                width_std[r, h] = float(np.nanstd(q90c_h - q10c_h))
+        regime_report = {
+            "regime_names": REGIME_NAMES,
+            "coverage_pre": cov_pre,
+            "coverage_post": cov_post,
+            "width_pre": width_pre,
+            "width_post": width_post,
+            "median_error": med_err,
+            "alpha_std": alpha_std,
+            "width_std": width_std,
+        }
+        if regime_thresholds is not None:
+            regime_report["thresholds"] = regime_thresholds
     print("aci_metrics", metrics)
 
     out = Path(args.out_npz)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, y=y, q10=q10_cal, q50=q50, q90=q90_cal, mask=mask, origin_t=origin_t, series_idx=series_idx)
+    npz_kwargs = {
+        "y": y,
+        "q10": q10_cal,
+        "q50": q50,
+        "q90": q90_cal,
+        "mask": mask,
+        "origin_t": origin_t,
+        "series_idx": series_idx,
+    }
+    if regime_labels is not None:
+        npz_kwargs["regime"] = regime_labels
+        npz_kwargs["alpha_used"] = alpha_used
+    np.savez(out, **npz_kwargs)
     if args.out_metrics:
-        np.savez(args.out_metrics, metrics=metrics)
+        if regime_report is not None:
+            np.savez(args.out_metrics, metrics=metrics, regime_report=regime_report)
+        else:
+            np.savez(args.out_metrics, metrics=metrics)
     if args.state_out:
         config_state = {
             "window": args.window,

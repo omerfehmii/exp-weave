@@ -98,7 +98,12 @@ def main() -> None:
         cfg["data"].get("train_frac", 0.7),
         cfg["data"].get("val_frac", 0.15),
     )
-    pre = apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    pre = apply_scaling(
+        series_list,
+        split.train_end,
+        scale_x=cfg["data"].get("scale_x", True),
+        scale_y=cfg["data"].get("scale_y", True),
+    )
 
     y_t_scaled = np.array([series_list[s_idx].y[t] for s_idx, t in zip(series_idx, origin_t)])
     if y_t_scaled.ndim == 2 and y_t_scaled.shape[1] > 1:

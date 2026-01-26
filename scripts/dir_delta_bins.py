@@ -221,7 +221,12 @@ def main() -> None:
         cfg["data"].get("min_past_obs", 1),
         cfg["data"].get("min_future_obs", 1),
     )
-    pre = apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    pre = apply_scaling(
+        series_list,
+        split.train_end,
+        scale_x=cfg["data"].get("scale_x", True),
+        scale_y=cfg["data"].get("scale_y", True),
+    )
     scale_std = 1.0
     if pre is not None and pre.y_scaler.std is not None:
         scale_std = float(np.ravel(pre.y_scaler.std)[0])

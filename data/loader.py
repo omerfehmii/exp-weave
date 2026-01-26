@@ -13,6 +13,7 @@ from .features import compute_delta_t, make_calendar_features, make_observation_
 @dataclass
 class SeriesData:
     y: np.ndarray
+    y_raw: Optional[np.ndarray] = None
     timestamps: Optional[np.ndarray] = None
     x_past_feats: Optional[np.ndarray] = None
     x_future_feats: Optional[np.ndarray] = None
@@ -38,11 +39,15 @@ class WindowedDataset(Dataset):
         indices: Sequence[Tuple[int, int]],
         L: int,
         H: int,
+        target_mode: str = "level",
+        target_log_eps: float = 1e-6,
     ) -> None:
         self.series_list = series_list
         self.indices = list(indices)
         self.L = L
         self.H = H
+        self.target_mode = target_mode
+        self.target_log_eps = target_log_eps
         for series in self.series_list:
             series.ensure_features()
 
@@ -65,6 +70,7 @@ class WindowedDataset(Dataset):
         future_slice = slice(t + 1, t + H + 1)
         y_past = y[past_slice]
         y_future = y[future_slice]
+        y_last = y_past[-1]
         if np.isnan(y_past).any():
             y_past = np.nan_to_num(y_past, nan=0.0)
         if x_past is None:
@@ -93,7 +99,23 @@ class WindowedDataset(Dataset):
         }
         if series.series_id is not None:
             batch["series_id"] = torch.tensor(series.series_id, dtype=torch.long)
-        target = torch.from_numpy(y_future.astype(np.float32))
+        if self.target_mode == "return":
+            target_arr = y_future - y_last[None, :]
+        elif self.target_mode == "log_return":
+            if series.y_raw is None:
+                y_raw = y
+            else:
+                y_raw = series.y_raw
+                if y_raw.ndim == 1:
+                    y_raw = y_raw[:, None]
+            y_past_raw = y_raw[past_slice]
+            y_future_raw = y_raw[future_slice]
+            y_last_raw = y_past_raw[-1]
+            eps = self.target_log_eps
+            target_arr = np.log(np.maximum(y_future_raw, eps) / np.maximum(y_last_raw[None, :], eps))
+        else:
+            target_arr = y_future
+        target = torch.from_numpy(target_arr.astype(np.float32))
         return batch, target
 
 
@@ -157,6 +179,7 @@ def compress_series_observed(series_list: List[SeriesData]) -> List[SeriesData]:
         compressed.append(
             SeriesData(
                 y=y_obs,
+                y_raw=None if series.y_raw is None else series.y_raw[idx],
                 timestamps=ts_obs,
                 x_past_feats=x_past_obs,
                 x_future_feats=x_future_obs,

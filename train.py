@@ -187,7 +187,12 @@ def build_series_list(path: str, observed_only: bool = False) -> List[SeriesData
     return series_list
 
 
-def apply_scaling(series_list: List[SeriesData], split_end: int, scale_x: bool = True) -> FoldFitPreprocessor:
+def apply_scaling(
+    series_list: List[SeriesData],
+    split_end: int,
+    scale_x: bool = True,
+    scale_y: bool = True,
+) -> FoldFitPreprocessor:
     y_train = np.concatenate([s.y[:split_end] for s in series_list], axis=0)
     mask_train = np.concatenate([s.mask[:split_end] for s in series_list], axis=0)
     x_train = None
@@ -195,11 +200,14 @@ def apply_scaling(series_list: List[SeriesData], split_end: int, scale_x: bool =
         x_train = np.concatenate([s.x_past_feats[:split_end] for s in series_list], axis=0)
     else:
         scale_x = False
-    pre = FoldFitPreprocessor(scale_y=True, scale_x=scale_x)
+    pre = FoldFitPreprocessor(scale_y=scale_y, scale_x=scale_x)
     pre.fit(y_train, x_train=x_train, mask=mask_train)
     warned = False
     for series in series_list:
-        series.y = pre.y_scaler.transform(series.y)
+        if series.y_raw is None:
+            series.y_raw = series.y.copy()
+        if scale_y:
+            series.y = pre.y_scaler.transform(series.y)
         if scale_x and series.x_past_feats is not None:
             series.x_past_feats = pre.x_scaler.transform(series.x_past_feats)
             if series.x_future_feats is not None:
@@ -221,8 +229,11 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
     dec_cfg = cfg.get("decoder", {})
     dual_path_cfg = dec_cfg.get("dual_path", {})
     missing_cfg = cfg.get("missingness", {})
+    moe_cfg = cfg.get("moe", {})
     delta_t_mode = missing_cfg.get("delta_t_mode", missing_cfg.get("dt_embedding", "MLP_LOG1P"))
     summary_cfg = patch_cfg.get("summary", {})
+    gate_cfg = patch_cfg.get("gate", {})
+    scale_drop_cfg = patch_cfg.get("scale_drop", {})
     dir_head_cfg = cfg.get("direction_head", {})
     config = ModelConfig(
         L=data_cfg["L"],
@@ -237,8 +248,17 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         mlp_hidden=model_cfg["mlp_hidden"],
         dropout=model_cfg["dropout"],
         fusion=patch_cfg["fusion"],
-        gate_entropy_floor=patch_cfg.get("gate", {}).get("entropy_floor"),
-        gate_temperature=patch_cfg.get("gate", {}).get("temperature", 1.0),
+        gate_entropy_floor=gate_cfg.get("entropy_floor"),
+        gate_temperature=gate_cfg.get("temperature", 1.0),
+        gate_logit_clip=gate_cfg.get("logit_clip"),
+        gate_fixed_weight=gate_cfg.get("fixed_weight"),
+        gate_use_regime_features=bool(gate_cfg.get("use_regime_features", False)),
+        gate_regime_window=int(gate_cfg.get("regime_window", data_cfg.get("L", 240))),
+        gate_regime_eps=float(gate_cfg.get("regime_eps", 1e-6)),
+        gate_disable_coarse=bool(gate_cfg.get("disable_coarse", False)),
+        gate_disable_fine=bool(gate_cfg.get("disable_fine", False)),
+        scale_drop_coarse=float(scale_drop_cfg.get("drop_coarse_p", scale_drop_cfg.get("coarse", 0.0))),
+        scale_drop_fine=float(scale_drop_cfg.get("drop_fine_p", scale_drop_cfg.get("fine", 0.0))),
         dual_sum_weight=patch_cfg.get("dual_sum_weight", "equal"),
         decoder_mode=decoder_cfg.get("mode", "CA_ONLY"),
         cats_enabled=decoder_cfg.get("cats_masking", {}).get("enabled", True),
@@ -260,6 +280,15 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         dir_head_type=dir_head_cfg.get("type", "hierarchical"),
         dir_head_detach=dir_head_cfg.get("detach", False),
         dir_head_dropout=dir_head_cfg.get("dropout", 0.0),
+        moe_enabled=bool(moe_cfg.get("enabled", False)),
+        moe_gate_hidden=int(moe_cfg.get("gate_hidden", model_cfg.get("d_model", 256))),
+        moe_gate_temperature=float(moe_cfg.get("gate_temperature", 1.0)),
+        moe_gate_logit_clip=moe_cfg.get("gate_logit_clip"),
+        moe_gate_use_regime_features=bool(moe_cfg.get("use_regime_features", False)),
+        moe_gate_regime_window=int(moe_cfg.get("regime_window", data_cfg.get("L", 240))),
+        moe_gate_regime_eps=float(moe_cfg.get("regime_eps", 1e-6)),
+        moe_expert_drop_trend=float(moe_cfg.get("expert_drop_trend", 0.0)),
+        moe_expert_drop_mr=float(moe_cfg.get("expert_drop_mr", 0.0)),
     )
     return MultiScaleForecastModel(config, scales)
 
@@ -362,7 +391,12 @@ def main() -> None:
     train_idx = select_indices_by_time(indices, split, "train", horizon=horizon, purge=split_purge, embargo=split_embargo)
     val_idx = select_indices_by_time(indices, split, "val", horizon=horizon, purge=split_purge, embargo=split_embargo)
 
-    apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    apply_scaling(
+        series_list,
+        split.train_end,
+        scale_x=cfg["data"].get("scale_x", True),
+        scale_y=cfg["data"].get("scale_y", True),
+    )
     min_past_obs = cfg["data"].get("min_past_obs", 1)
     min_future_obs = cfg["data"].get("min_future_obs", 1)
     train_idx = filter_indices_with_observed(series_list, train_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs)
@@ -372,8 +406,24 @@ def main() -> None:
     if not val_idx:
         print("warning: no validation samples after filtering.")
 
-    train_ds = WindowedDataset(series_list, train_idx, cfg["data"]["L"], cfg["data"]["H"])
-    val_ds = WindowedDataset(series_list, val_idx, cfg["data"]["L"], cfg["data"]["H"])
+    target_mode = cfg["data"].get("target_mode", "level")
+    target_log_eps = float(cfg["data"].get("target_log_eps", 1e-6))
+    train_ds = WindowedDataset(
+        series_list,
+        train_idx,
+        cfg["data"]["L"],
+        cfg["data"]["H"],
+        target_mode=target_mode,
+        target_log_eps=target_log_eps,
+    )
+    val_ds = WindowedDataset(
+        series_list,
+        val_idx,
+        cfg["data"]["L"],
+        cfg["data"]["H"],
+        target_mode=target_mode,
+        target_log_eps=target_log_eps,
+    )
     batch_size = cfg["training"].get("batch_size", 32)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
@@ -414,6 +464,7 @@ def main() -> None:
 
     loss_cfg = cfg.get("training", {}).get("loss", {})
     dir_cfg = cfg.get("training", {}).get("direction", {})
+    gate_cfg = cfg.get("patching", {}).get("gate", {})
     dir_enabled = dir_cfg.get("enabled", False)
     dir_delta_mode = dir_cfg.get("delta_mode", "origin")
     dir_type = dir_cfg.get("type", "hierarchical")
@@ -437,6 +488,9 @@ def main() -> None:
     width_min_weight = loss_cfg.get("width_min_weight", 0.0)
     repulsion_weight = loss_cfg.get("repulsion_weight", 0.0)
     repulsion_scale = loss_cfg.get("repulsion_scale", 1.0)
+    gate_entropy_weight = float(gate_cfg.get("entropy_weight", 0.0))
+    moe_entropy_weight = float(loss_cfg.get("moe_entropy_weight", 0.0))
+    moe_balance_weight = float(loss_cfg.get("moe_balance_weight", 0.0))
 
     mt_cfg = cfg.get("training", {}).get("multi_task", {})
     mt_mode = str(mt_cfg.get("mode", "none")).lower()
@@ -511,9 +565,25 @@ def main() -> None:
                 repulsion = torch.exp(-width / max(repulsion_scale, 1e-6)) * mask
                 denom = torch.clamp(mask.sum(), min=1.0)
                 main_loss = main_loss + repulsion_weight * (repulsion.sum() / denom)
+            if gate_entropy_weight > 0 and "gate_weights" in extras:
+                w = torch.clamp(extras["gate_weights"], 1e-8, 1.0)
+                ent = -torch.sum(w * torch.log(w), dim=-1).mean()
+                main_loss = main_loss - gate_entropy_weight * ent
+            if (moe_entropy_weight > 0 or moe_balance_weight > 0) and "moe_weights" in extras:
+                w = torch.clamp(extras["moe_weights"], 1e-8, 1.0)
+                if moe_entropy_weight > 0:
+                    ent = -torch.sum(w * torch.log(w), dim=-1).mean()
+                    main_loss = main_loss - moe_entropy_weight * ent
+                if moe_balance_weight > 0:
+                    mean_w = w.mean(dim=0)
+                    target = torch.full_like(mean_w, 1.0 / mean_w.shape[0])
+                    balance = torch.sum((mean_w - target) ** 2)
+                    main_loss = main_loss + moe_balance_weight * balance
             dir_loss_total = None
             if dir_enabled:
                 y_last = batch["y_past"][:, -1, 0]
+                if target_mode != "level":
+                    y_last = torch.zeros_like(y_last)
                 if dir_delta_mode == "step":
                     ref = torch.cat([y_last[:, None], y_true[:, :-1]], dim=1)
                 else:
@@ -711,6 +781,8 @@ def main() -> None:
                 val_loss += (pinball_weight * masked_pinball_loss_torch(y_true, q_hat, quantiles, mask, quantile_weights)).item()
                 if dir_enabled:
                     y_last = batch["y_past"][:, -1, 0]
+                    if target_mode != "level":
+                        y_last = torch.zeros_like(y_last)
                     if dir_delta_mode == "step":
                         ref = torch.cat([y_last[:, None], y_true[:, :-1]], dim=1)
                     else:

@@ -158,7 +158,12 @@ def main() -> None:
         cfg["data"].get("min_past_obs", 1),
         cfg["data"].get("min_future_obs", 1),
     )
-    apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    apply_scaling(
+        series_list,
+        split.train_end,
+        scale_x=cfg["data"].get("scale_x", True),
+        scale_y=cfg["data"].get("scale_y", True),
+    )
 
     train_idx = select_indices_by_time(
         indices,
@@ -178,7 +183,16 @@ def main() -> None:
     )
     tau_h = compute_delta_thresholds(series_list, train_idx, horizon, args.delta_quantile, delta_mode=args.delta_mode)
 
-    ds = WindowedDataset(series_list, split_idx, cfg["data"]["L"], cfg["data"]["H"])
+    target_mode = cfg["data"].get("target_mode", "level")
+    target_log_eps = float(cfg["data"].get("target_log_eps", 1e-6))
+    ds = WindowedDataset(
+        series_list,
+        split_idx,
+        cfg["data"]["L"],
+        cfg["data"]["H"],
+        target_mode=target_mode,
+        target_log_eps=target_log_eps,
+    )
     loader = DataLoader(ds, batch_size=cfg["training"].get("batch_size", 64))
 
     device = torch.device(cfg["training"].get("device", "cpu"))
@@ -205,7 +219,14 @@ def main() -> None:
             cfg["data"].get("min_past_obs", 1),
             cfg["data"].get("min_future_obs", 1),
         )
-        ds = WindowedDataset(series_list, split_idx, cfg["data"]["L"], cfg["data"]["H"])
+        ds = WindowedDataset(
+            series_list,
+            split_idx,
+            cfg["data"]["L"],
+            cfg["data"]["H"],
+            target_mode=target_mode,
+            target_log_eps=target_log_eps,
+        )
         loader = DataLoader(ds, batch_size=cfg["training"].get("batch_size", 64))
 
         move_logits_list = []
@@ -229,7 +250,10 @@ def main() -> None:
                     move_logits_list.append(extras["dir_move_logits"].cpu().numpy())
                     dir_logits_list.append(extras["dir_dir_logits"].cpu().numpy())
                 y_future_list.append(target[..., 0].cpu().numpy())
-                y_last_list.append(batch["y_past"][:, -1, 0].cpu().numpy())
+                y_last = batch["y_past"][:, -1, 0].cpu().numpy()
+                if target_mode != "level":
+                    y_last = np.zeros_like(y_last)
+                y_last_list.append(y_last)
                 mask_list.append(np.isfinite(target[..., 0].cpu().numpy()).astype(np.float32))
                 origin_mask_list.append(batch["mask"][:, -1, 0].cpu().numpy())
                 dir_cfg = cfg.get("training", {}).get("direction", {})

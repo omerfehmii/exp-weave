@@ -172,7 +172,12 @@ def _prepare_arrays(cfg: dict, preds_path: str, delta_mode: str) -> Tuple[np.nda
         cfg["data"].get("train_frac", 0.7),
         cfg["data"].get("val_frac", 0.15),
     )
-    pre = apply_scaling(series_list, split.train_end, scale_x=cfg["data"].get("scale_x", True))
+    pre = apply_scaling(
+        series_list,
+        split.train_end,
+        scale_x=cfg["data"].get("scale_x", True),
+        scale_y=cfg["data"].get("scale_y", True),
+    )
 
     y_orig = pre.inverse_y(y)
     q10_orig = pre.inverse_y(q10)
