@@ -65,12 +65,18 @@ def main() -> None:
     parser.add_argument("--disp_hist_window", type=int, default=0)
     parser.add_argument("--disp_flat_q_low", type=float, default=0.0)
     parser.add_argument("--disp_flat_q_high", type=float, default=0.0)
+    parser.add_argument("--disp_scale_q_low", type=float, default=0.0)
+    parser.add_argument("--disp_scale_q_high", type=float, default=0.0)
+    parser.add_argument("--disp_scale_floor", type=float, default=0.0)
+    parser.add_argument("--disp_scale_power", type=float, default=1.0)
     parser.add_argument("--consistency_min", type=float, default=None)
     parser.add_argument("--consistency_scale", type=float, default=0.0)
     parser.add_argument("--disagree_q_low", type=float, default=0.0)
     parser.add_argument("--disagree_q_high", type=float, default=0.0)
     parser.add_argument("--disagree_hist_window", type=int, default=0)
     parser.add_argument("--disagree_scale", type=float, default=0.0)
+    parser.add_argument("--gate_combine", default="mul", choices=["mul", "min", "avg"])
+    parser.add_argument("--gate_avg_weights", default="1,1,1")
     parser.add_argument("--ema_halflife", type=float, default=0.0)
     parser.add_argument("--ema_halflife_min", type=float, default=0.0)
     parser.add_argument("--ema_halflife_max", type=float, default=0.0)
@@ -149,6 +155,9 @@ def main() -> None:
     gated_flat = 0
     gated_consistency = 0
     gated_disagree = 0
+    gate_scale_sum = 0.0
+    gate_scale_count = 0
+    wD, wU, wS = _parse_gate_weights(args.gate_avg_weights)
     use_dynamic_ema = (
         args.ema_halflife_min > 0
         and args.ema_halflife_max > 0
@@ -249,26 +258,68 @@ def main() -> None:
             for j, a in enumerate(assets):
                 ema_state[a] = (1.0 - alpha_t) * ema_state[a] + alpha_t * mu_t[j]
                 mu_t[j] = ema_state[a]
-        if args.disp_hi > args.disp_lo:
+        # dispersion soft scaling
+        d_scale = 1.0
+        if args.disp_scale_q_low > 0 and args.disp_scale_q_high > args.disp_scale_q_low:
+            hist = disp_hist[-args.disp_hist_window :] if args.disp_hist_window > 0 else disp_hist
+            if hist:
+                q_low = float(np.quantile(hist, args.disp_scale_q_low))
+                q_high = float(np.quantile(hist, args.disp_scale_q_high))
+                if q_high > q_low:
+                    m = (disp - q_low) / (q_high - q_low)
+                    m = float(np.clip(m, 0.0, 1.0))
+                    m = m ** max(args.disp_scale_power, 1e-6)
+                    d_scale = float(args.disp_scale_floor + (1.0 - args.disp_scale_floor) * m)
+        elif args.disp_hi > args.disp_lo:
             if disp <= args.disp_lo:
-                scale = args.disp_min_scale
+                d_scale = args.disp_min_scale
             elif disp >= args.disp_hi:
-                scale = 1.0
+                d_scale = 1.0
             else:
-                scale = args.disp_min_scale + (disp - args.disp_lo) * (1.0 - args.disp_min_scale) / (args.disp_hi - args.disp_lo)
-            mu_t = mu_t * scale
+                d_scale = args.disp_min_scale + (disp - args.disp_lo) * (1.0 - args.disp_min_scale) / (args.disp_hi - args.disp_lo)
+
+        # disagreement scaling
+        u_scale = 1.0
+        if mu_std is not None and (args.disagree_q_low > 0 or args.disagree_q_high > 0):
+            u_t = float(np.mean(mu_std[idx]))
+            dhist = disagree_hist[-args.disagree_hist_window :] if args.disagree_hist_window > 0 else disagree_hist
+            if dhist:
+                q_hi = float(np.quantile(dhist, args.disagree_q_high)) if args.disagree_q_high > 0 else None
+                q_lo = float(np.quantile(dhist, args.disagree_q_low)) if args.disagree_q_low > 0 else None
+                if q_hi is not None and q_lo is not None and q_hi > q_lo:
+                    if u_t <= q_lo:
+                        u_scale = 1.0
+                    elif u_t >= q_hi:
+                        u_scale = args.disagree_scale
+                    else:
+                        frac = (u_t - q_lo) / (q_hi - q_lo)
+                        u_scale = 1.0 - frac * (1.0 - args.disagree_scale)
+        # self-consistency scaling
+        s_scale = cons_scale
+
+        # combine scales
+        if args.gate_combine == "min":
+            gate_scale = min(d_scale, u_scale, s_scale)
+        elif args.gate_combine == "avg":
+            gate_scale = wD * d_scale + wU * u_scale + wS * s_scale
+        else:
+            gate_scale = d_scale * u_scale * s_scale
+
         if not gate_on:
+            gate_scale = 0.0
             gated_flat += 1
         if not disagree_on:
             gated_disagree += 1
-        if (not gate_on) or (not disagree_on) or (cons_scale <= 0):
+        if gate_scale <= 0.0:
             w_full = np.zeros_like(prev_w)
             pnl_time.append(0.0)
             turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
             prev_w = w_full
             continue
-        if cons_scale != 1.0:
-            mu_t = mu_t * cons_scale
+
+        mu_t = mu_t * gate_scale
+        gate_scale_sum += gate_scale
+        gate_scale_count += 1
         if args.topk and args.topk > 0:
             k = int(args.topk)
             if idx.size < 2 * k:
@@ -334,7 +385,11 @@ def main() -> None:
     )
     _summarize("portfolio", pnl_time)
     if pnl_time.size > 0:
-        print(f"gate_flat_frac={gated_flat / pnl_time.size:.3f} gate_disagree_frac={gated_disagree / pnl_time.size:.3f} gate_consistency_flat_frac={gated_consistency / pnl_time.size:.3f}")
+        avg_scale = gate_scale_sum / max(gate_scale_count, 1)
+        print(
+            f"gate_flat_frac={gated_flat / pnl_time.size:.3f} gate_disagree_frac={gated_disagree / pnl_time.size:.3f} "
+            f"gate_consistency_flat_frac={gated_consistency / pnl_time.size:.3f} gate_scale_mean={avg_scale:.3f}"
+        )
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
         print(f"turnover_mean={avg_turnover:.6f}")
@@ -398,6 +453,17 @@ def _apply_score_map(scores: np.ndarray, edges: np.ndarray, values: np.ndarray) 
             idx = np.array([np.argmax(edges[:, 1])])
         out[i] = values[int(idx[0])]
     return out
+
+
+def _parse_gate_weights(raw: str) -> tuple[float, float, float]:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) != 3:
+        return 1.0, 1.0, 1.0
+    vals = [float(p) for p in parts]
+    total = sum(vals)
+    if total <= 0:
+        return 1.0, 1.0, 1.0
+    return vals[0] / total, vals[1] / total, vals[2] / total
 
 
 if __name__ == "__main__":
