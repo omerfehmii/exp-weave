@@ -75,6 +75,11 @@ def main() -> None:
     parser.add_argument("--disagree_q_high", type=float, default=0.0)
     parser.add_argument("--disagree_hist_window", type=int, default=0)
     parser.add_argument("--disagree_scale", type=float, default=0.0)
+    parser.add_argument("--shock_hist_window", type=int, default=0)
+    parser.add_argument("--shock_q", type=float, default=0.0)
+    parser.add_argument("--shock_k", type=float, default=0.0)
+    parser.add_argument("--shock_floor", type=float, default=0.0)
+    parser.add_argument("--shock_metric", default="median", choices=["median", "p90", "p95"])
     parser.add_argument("--gate_combine", default="mul", choices=["mul", "min", "avg"])
     parser.add_argument("--gate_avg_weights", default="1,1,1")
     parser.add_argument("--ema_halflife", type=float, default=0.0)
@@ -152,6 +157,16 @@ def main() -> None:
                 var = max(s2 / max(n, 1) - mean * mean, 0.0)
                 sigma[t] = np.sqrt(var)
             risk_cache.append(sigma)
+    shock_cache = None
+    if args.shock_q and args.shock_q > 0:
+        shock_cache = []
+        for series in series_list:
+            y_hist = series.y.astype(np.float64)
+            if y_hist.ndim > 1:
+                y_hist = y_hist[:, 0]
+            y_hist = np.nan_to_num(y_hist, nan=0.0)
+            r = np.diff(y_hist, prepend=np.nan)
+            shock_cache.append(r)
     if args.value_scale == "orig":
         if use_return_target:
             y = pre.inverse_return(y)
@@ -213,6 +228,9 @@ def main() -> None:
     hhi_time = []
     top10_time = []
     turnover_time = []
+    shock_hist = []
+    shock_scale_sum = 0.0
+    shock_scale_count = 0
     for t in np.unique(time_key):
         idx = np.where((time_key == t) & valid)[0]
         if idx.size == 0:
@@ -252,6 +270,33 @@ def main() -> None:
             disp_hist.append(disp)
         else:
             disp_hist.append(disp)
+        # tail-shock scaling (uses last observed return)
+        m_shock = 1.0
+        if shock_cache is not None and args.shock_q and args.shock_q > 0:
+            shock_vals = []
+            for a, t0 in zip(assets, origin_t[idx]):
+                if a < len(shock_cache):
+                    r = shock_cache[a]
+                    if 0 <= t0 < r.size:
+                        v = r[int(t0)]
+                        if np.isfinite(v):
+                            shock_vals.append(abs(v))
+            if shock_vals:
+                if args.shock_metric == "p90":
+                    shock_t = float(np.percentile(shock_vals, 90))
+                elif args.shock_metric == "p95":
+                    shock_t = float(np.percentile(shock_vals, 95))
+                else:
+                    shock_t = float(np.median(shock_vals))
+            else:
+                shock_t = 0.0
+            hist_s = shock_hist[-args.shock_hist_window :] if args.shock_hist_window > 0 else shock_hist
+            if hist_s:
+                q = float(np.quantile(hist_s, args.shock_q))
+                if q > 0 and shock_t > q:
+                    frac = (shock_t - q) / (q + 1e-12)
+                    m_shock = max(args.shock_floor, 1.0 - args.shock_k * frac)
+            shock_hist.append(shock_t)
         # disagreement gate (requires q50_std in preds)
         if mu_std is not None and (args.disagree_q_low > 0 or args.disagree_q_high > 0):
             u_t = float(np.mean(mu_std[idx]))
@@ -424,8 +469,10 @@ def main() -> None:
             w_full = w_full / denom_full
         if args.gross_target and args.gross_target > 0:
             gross = np.sum(np.abs(w_full[assets]))
-            target_gross = args.gross_target * gate_scale
-            if gross > 1e-12:
+            target_gross = args.gross_target * gate_scale * m_shock
+            if target_gross <= 0.0:
+                w_full[assets] = 0.0
+            elif gross > 1e-12:
                 w_full[assets] = w_full[assets] * (target_gross / gross)
         w_now = w_full[assets]
         pnl_time.append(float(np.sum(w_now * ret_t)))
@@ -436,6 +483,8 @@ def main() -> None:
                 top10_time.append(float(np.sum(np.sort(np.abs(w_now))[-topk:])))
         turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
         prev_w = w_full
+        shock_scale_sum += m_shock
+        shock_scale_count += 1
 
     pnl_time = np.asarray(pnl_time, dtype=np.float64)
     print(
@@ -449,6 +498,8 @@ def main() -> None:
             f"gate_flat_frac={gated_flat / pnl_time.size:.3f} gate_disagree_frac={gated_disagree / pnl_time.size:.3f} "
             f"gate_consistency_flat_frac={gated_consistency / pnl_time.size:.3f} gate_scale_mean={avg_scale:.3f}"
         )
+        if shock_scale_count > 0:
+            print(f"shock_scale_mean={shock_scale_sum / max(shock_scale_count, 1):.3f}")
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
         print(f"turnover_mean={avg_turnover:.6f}")
