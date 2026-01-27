@@ -372,8 +372,9 @@ def main() -> None:
             w_full = w_full / denom_full
         if args.gross_target and args.gross_target > 0:
             gross = np.sum(np.abs(w_full[assets]))
+            target_gross = args.gross_target * gate_scale
             if gross > 1e-12:
-                w_full[assets] = w_full[assets] * (args.gross_target / gross)
+                w_full[assets] = w_full[assets] * (target_gross / gross)
         pnl_time.append(float(np.sum(w_full[assets] * ret_t)))
         turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
         prev_w = w_full
