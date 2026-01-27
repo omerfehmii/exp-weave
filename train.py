@@ -596,6 +596,12 @@ def main() -> None:
     cs_rank_use_residual = bool(cs_rank_cfg.get("use_residual", True))
     warned_cs_label = False
 
+    grad_diag_cfg = cfg.get("training", {}).get("grad_diag", {})
+    grad_diag_enabled = bool(grad_diag_cfg.get("enabled", False))
+    grad_diag_every = int(grad_diag_cfg.get("every_n_steps", 200))
+    grad_diag_shared_only = bool(grad_diag_cfg.get("shared_only", True))
+    grad_diag_use_weighted = bool(grad_diag_cfg.get("use_weighted", True))
+
     mt_cfg = cfg.get("training", {}).get("multi_task", {})
     mt_mode = str(mt_cfg.get("mode", "none")).lower()
     if mt_mode not in {"none", "pcgrad", "gradnorm"}:
@@ -616,6 +622,12 @@ def main() -> None:
             gradnorm_weights = torch.ones(2, device=device)
         shared_params = [p for p, use in zip(all_params, shared_mask) if use]
         shared_params_mask = [True] * len(shared_params)
+    diag_params: List[torch.nn.Parameter] = []
+    diag_params_mask: List[bool] = []
+    if grad_diag_enabled:
+        diag_mask = build_shared_mask(model, all_params) if grad_diag_shared_only else [True] * len(all_params)
+        diag_params = [p for p, use in zip(all_params, diag_mask) if use]
+        diag_params_mask = [True] * len(diag_params)
 
     if dir_enabled:
         if dir_weights_cfg is None:
@@ -723,6 +735,8 @@ def main() -> None:
                     target = torch.full_like(mean_w, 1.0 / mean_w.shape[0])
                     balance = torch.sum((mean_w - target) ** 2)
                     main_loss = main_loss + moe_balance_weight * balance
+            point_loss = main_loss
+            rank_loss = None
             if cs_rank_enabled and cs_rank_weight > 0.0:
                 if not cs_batch_enabled:
                     if not warned_cs_label:
@@ -757,6 +771,38 @@ def main() -> None:
                             main_loss = main_loss + cs_rank_weight * rank_loss
                             rank_loss_sum += float(rank_loss.item())
                             rank_batches += 1
+            if (
+                grad_diag_enabled
+                and rank_loss is not None
+                and point_loss.requires_grad
+                and (global_step % max(1, grad_diag_every) == 0)
+            ):
+                rank_loss_scaled = rank_loss * cs_rank_weight if grad_diag_use_weighted else rank_loss
+                g_point = torch.autograd.grad(point_loss, diag_params, retain_graph=True, allow_unused=True)
+                g_rank = torch.autograd.grad(rank_loss_scaled, diag_params, retain_graph=True, allow_unused=True)
+                g_point_norm = grad_norm(g_point, diag_params_mask, device)
+                g_rank_norm = grad_norm(g_rank, diag_params_mask, device)
+                g_dot = grad_dot(g_point, g_rank, diag_params_mask, device)
+                denom = g_point_norm * g_rank_norm + 1e-12
+                g_cos = g_dot / denom
+                ratio = g_rank_norm / (g_point_norm + 1e-12)
+                print(
+                    "grad_diag step="
+                    f"{global_step} point_norm={g_point_norm.item():.4f} "
+                    f"rank_norm={g_rank_norm.item():.4f} cos={g_cos.item():.4f} "
+                    f"rank_over_point={ratio.item():.4f}"
+                )
+                if log_path is not None:
+                    append_log(
+                        log_path,
+                        {
+                            "step": global_step,
+                            "grad_point_norm": float(g_point_norm.item()),
+                            "grad_rank_norm": float(g_rank_norm.item()),
+                            "grad_rank_point_cos": float(g_cos.item()),
+                            "grad_rank_over_point": float(ratio.item()),
+                        },
+                    )
             dir_loss_total = None
             if dir_enabled:
                 y_last = batch["y_past"][:, -1, 0]
