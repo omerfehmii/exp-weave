@@ -399,10 +399,10 @@ def main() -> None:
     metrics = {
         "mae": mae,
         "rmse": rmse,
-        "coverage90": cov,
-        "width90": width,
+        "coverage80": cov,
+        "width80": width,
         "coverage_traj": cov_traj,
-        "coverage90_min": cov_min,
+        "coverage80_min": cov_min,
         "alpha_target": alpha_target,
     }
     regime_report = None

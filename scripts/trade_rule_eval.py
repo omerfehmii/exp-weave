@@ -86,6 +86,7 @@ def _assign_rank_sides(
     times: np.ndarray,
     valid_mask: np.ndarray,
     topk: int,
+    rank_mode: str,
 ) -> np.ndarray:
     sides = np.zeros_like(scores, dtype=np.int8)
     if topk <= 0:
@@ -93,13 +94,19 @@ def _assign_rank_sides(
     uniq = np.unique(times)
     for t in uniq:
         idx = np.where((times == t) & valid_mask)[0]
-        if idx.size < 2 * topk:
-            continue
+        if rank_mode == "long_short":
+            if idx.size < 2 * topk:
+                continue
+        else:
+            if idx.size < topk:
+                continue
         order = np.argsort(scores[idx])
-        bottom = idx[order[:topk]]
-        top = idx[order[-topk:]]
-        sides[top] = 1
-        sides[bottom] = -1
+        if rank_mode in {"long_short", "short_only"}:
+            bottom = idx[order[:topk]]
+            sides[bottom] = -1
+        if rank_mode in {"long_short", "long_only"}:
+            top = idx[order[-topk:]]
+            sides[top] = 1
     return sides
 
 
@@ -108,6 +115,7 @@ def _assign_rank_buckets(
     times: np.ndarray,
     valid_mask: np.ndarray,
     topk: int,
+    rank_mode: str,
 ) -> np.ndarray:
     buckets = np.zeros_like(scores, dtype=np.int8)
     if topk <= 0:
@@ -115,20 +123,146 @@ def _assign_rank_buckets(
     uniq = np.unique(times)
     for t in uniq:
         idx = np.where((times == t) & valid_mask)[0]
-        if idx.size < 2 * topk:
-            continue
+        if rank_mode == "long_short":
+            if idx.size < 2 * topk:
+                continue
+        else:
+            if idx.size < topk:
+                continue
         order = np.argsort(scores[idx])
-        bottom = idx[order[:topk]]
-        top = idx[order[-topk:][::-1]]
-        if bottom.size:
-            buckets[bottom[0]] = 1
-            if bottom.size > 1:
-                buckets[bottom[1:]] = 2
-        if top.size:
-            buckets[top[0]] = 1
-            if top.size > 1:
-                buckets[top[1:]] = 2
+        if rank_mode in {"long_short", "short_only"}:
+            bottom = idx[order[:topk]]
+            if bottom.size:
+                buckets[bottom[0]] = 1
+                if bottom.size > 1:
+                    buckets[bottom[1:]] = 2
+        if rank_mode in {"long_short", "long_only"}:
+            top = idx[order[-topk:][::-1]]
+            if top.size:
+                buckets[top[0]] = 1
+                if top.size > 1:
+                    buckets[top[1:]] = 2
     return buckets
+
+
+def _apply_score_transform(
+    scores: np.ndarray,
+    valid: np.ndarray,
+    series_idx: np.ndarray,
+    time_key: np.ndarray,
+    mode: str,
+    ts_lookback: int,
+) -> np.ndarray:
+    if mode == "none":
+        return scores
+    out = scores.copy()
+    if mode in {"cs_demean", "cs_zscore"}:
+        uniq = np.unique(time_key)
+        for t in uniq:
+            idx = np.where((time_key == t) & valid)[0]
+            if idx.size == 0:
+                continue
+            mean = float(np.mean(scores[idx]))
+            if mode == "cs_demean":
+                out[idx] = scores[idx] - mean
+            else:
+                std = float(np.std(scores[idx]))
+                if std < 1e-8:
+                    std = 1.0
+                out[idx] = (scores[idx] - mean) / std
+        return out
+    if mode == "ts_zscore":
+        order = np.lexsort((time_key, series_idx))
+        unique_assets = np.unique(series_idx)
+        for asset in unique_assets:
+            idx = order[series_idx[order] == asset]
+            if idx.size == 0:
+                continue
+            for j, gidx in enumerate(idx):
+                if ts_lookback > 0:
+                    start = max(0, j - ts_lookback + 1)
+                else:
+                    start = 0
+                window = idx[start : j + 1]
+                window = window[valid[window]]
+                if window.size == 0:
+                    out[gidx] = 0.0
+                    continue
+                wvals = scores[window]
+                mean = float(np.mean(wvals))
+                std = float(np.std(wvals))
+                if std < 1e-8:
+                    std = 1.0
+                out[gidx] = (scores[gidx] - mean) / std
+        return out
+    raise ValueError(f"Unknown score_transform: {mode}")
+
+
+def _mad(x: np.ndarray) -> float:
+    med = float(np.median(x))
+    return float(np.median(np.abs(x - med)))
+
+
+def _center_scale(x: np.ndarray, stat: str, scale: str) -> Tuple[float, float]:
+    if stat == "median":
+        center = float(np.median(x))
+    else:
+        center = float(np.mean(x))
+    if scale == "mad":
+        sc = _mad(x)
+    else:
+        sc = float(np.std(x))
+    if sc < 1e-8:
+        sc = 0.0
+    return center, sc
+
+
+def _realized_vol(
+    series: np.ndarray,
+    mask: np.ndarray | None,
+    t: int,
+    lookback: int,
+    return_mode: str,
+    scale_mode: str,
+    floor: float,
+) -> float:
+    if t <= 0:
+        return floor
+    if series.ndim > 1:
+        series = series[:, 0]
+    if mask is not None and mask.ndim > 1:
+        mask = mask[:, 0]
+    start = max(1, t - lookback + 1)
+    seg = series[start - 1 : t + 1]
+    if seg.size < 2:
+        return floor
+    if return_mode == "pct":
+        prev = seg[:-1]
+        denom = np.maximum(np.abs(prev), 1e-8)
+        ret = (seg[1:] - prev) / denom
+    elif return_mode == "log":
+        prev = seg[:-1]
+        curr = seg[1:]
+        valid = (prev > 0) & (curr > 0)
+        ret = np.zeros_like(curr, dtype=np.float32)
+        ret[valid] = np.log(curr[valid]) - np.log(prev[valid])
+        ret = ret[valid]
+    else:
+        ret = np.diff(seg)
+    if mask is not None:
+        m_prev = mask[start - 1 : t]
+        m_curr = mask[start : t + 1]
+        valid = (m_prev > 0) & (m_curr > 0)
+        ret = ret[valid]
+    if ret.size == 0:
+        return floor
+    if scale_mode == "mad":
+        sc = _mad(ret)
+    else:
+        sc = float(np.std(ret))
+    if sc < floor:
+        return floor
+    return float(sc)
 
 
 def _compute_time_metrics(
@@ -490,7 +624,7 @@ def main() -> None:
     parser.add_argument("--preds", required=True)
     parser.add_argument("--out_summary", required=True)
     parser.add_argument("--out_trades", default=None)
-    parser.add_argument("--rule", default="prob_cost", choices=["prob_cost", "conformal_bounds", "rank"])
+    parser.add_argument("--rule", default="prob_cost", choices=["prob_cost", "conformal_bounds", "rank", "ts"])
     parser.add_argument("--score_mode", default="mean", choices=["mean", "prob_edge", "q50", "edge_prob"])
     parser.add_argument("--horizons", default="")
     parser.add_argument("--return_mode", default="diff", choices=["diff", "pct", "log"])
@@ -504,8 +638,25 @@ def main() -> None:
     parser.add_argument("--cost_k", type=float, default=0.0)
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--rebalance_hours", type=int, default=1)
+    parser.add_argument("--rank_mode", default="long_short", choices=["long_short", "long_only", "short_only"])
     parser.add_argument("--rank_normalize", action="store_true")
     parser.add_argument("--rank_gross_exposure", type=float, default=1.0)
+    parser.add_argument(
+        "--score_transform",
+        default="none",
+        choices=["none", "cs_demean", "cs_zscore", "ts_zscore"],
+    )
+    parser.add_argument("--ts_lookback", type=int, default=20)
+    parser.add_argument("--ts_min_count", type=int, default=10)
+    parser.add_argument("--ts_stat", default="median", choices=["mean", "median"])
+    parser.add_argument("--ts_scale", default="std", choices=["std", "mad"])
+    parser.add_argument("--ts_z_entry", type=float, default=1.0)
+    parser.add_argument("--ts_z_exit", type=float, default=None)
+    parser.add_argument("--ts_z_cap", type=float, default=2.0)
+    parser.add_argument("--ts_use_vol", action="store_true")
+    parser.add_argument("--ts_vol_lookback", type=int, default=240)
+    parser.add_argument("--ts_vol_mode", default="std", choices=["std", "mad"])
+    parser.add_argument("--ts_vol_floor", type=float, default=1e-6)
     parser.add_argument("--width_drop_q", type=float, default=0.0)
     parser.add_argument("--hold_min_hours", type=int, default=0)
     parser.add_argument("--flip_penalty_bps", type=float, default=0.0)
@@ -517,6 +668,7 @@ def main() -> None:
     parser.add_argument("--size_cap", type=float, default=5.0)
     parser.add_argument("--size_zero_k", type=float, default=0.0)
     parser.add_argument("--group_by", default="origin", choices=["origin", "timestamp"])
+    parser.add_argument("--out_asset", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -691,7 +843,61 @@ def main() -> None:
 
         side = np.zeros_like(mu_r, dtype=np.int8)
         rank_bucket = np.zeros_like(mu_r, dtype=np.int8)
-        if args.rule == "prob_cost":
+        size = None
+        if args.rule == "ts":
+            z_entry = float(args.ts_z_entry)
+            z_exit = z_entry if args.ts_z_exit is None else float(args.ts_z_exit)
+            history: Dict[int, List[float]] = {}
+            last_side: Dict[int, int] = {}
+            size = np.zeros_like(mu_r, dtype=np.float32)
+            order = np.lexsort((origin_t, series_idx))
+            for idx in order:
+                if not valid[idx]:
+                    continue
+                s_idx = int(series_idx[idx])
+                t_idx = int(origin_t[idx])
+                hist = history.get(s_idx, [])
+                z = 0.0
+                if len(hist) >= args.ts_min_count:
+                    if args.ts_lookback > 0:
+                        window = np.asarray(hist[-args.ts_lookback :], dtype=np.float32)
+                    else:
+                        window = np.asarray(hist, dtype=np.float32)
+                    center, sc = _center_scale(window, args.ts_stat, args.ts_scale)
+                    if sc > 0:
+                        z = (float(mu_r[idx]) - center) / sc
+                hist.append(float(mu_r[idx]))
+                history[s_idx] = hist
+                curr = last_side.get(s_idx, 0)
+                if curr == 0:
+                    if abs(z) >= z_entry:
+                        curr = 1 if z > 0 else -1
+                else:
+                    if abs(z) < z_exit:
+                        curr = 0
+                    elif np.sign(z) != curr and abs(z) >= z_entry:
+                        curr = 1 if z > 0 else -1
+                side[idx] = curr
+                last_side[s_idx] = curr
+                if curr != 0:
+                    base = abs(z) / max(float(args.ts_z_cap), 1e-8)
+                    if base > 1.0:
+                        base = 1.0
+                    if args.ts_use_vol:
+                        series = series_list[s_idx].y_raw if series_list[s_idx].y_raw is not None else series_list[s_idx].y
+                        m = series_list[s_idx].mask
+                        vol = _realized_vol(
+                            series,
+                            m,
+                            t_idx,
+                            int(args.ts_vol_lookback),
+                            args.return_mode,
+                            args.ts_vol_mode,
+                            float(args.ts_vol_floor),
+                        )
+                        base = base / max(vol, float(args.ts_vol_floor))
+                    size[idx] = base
+        elif args.rule == "prob_cost":
             take_long = (p_plus > args.tau) & (p_plus >= p_minus)
             take_short = (p_minus > args.tau) & (p_minus > p_plus)
             side[take_long] = 1
@@ -701,8 +907,16 @@ def main() -> None:
             side[q90_h < -cost] = -1
         elif args.rule == "rank":
             score = _select_scores(args.score_mode, mu_r, p_plus, p_minus)
-            side = _assign_rank_sides(score, time_key, valid, args.topk)
-            rank_bucket = _assign_rank_buckets(score, time_key, valid, args.topk)
+            score = _apply_score_transform(
+                score,
+                valid,
+                series_idx,
+                time_key,
+                args.score_transform,
+                args.ts_lookback,
+            )
+            side = _assign_rank_sides(score, time_key, valid, args.topk, args.rank_mode)
+            rank_bucket = _assign_rank_buckets(score, time_key, valid, args.topk, args.rank_mode)
             if args.min_edge_thresh > 0.0:
                 if args.score_mode not in {"prob_edge", "edge_prob"}:
                     raise ValueError("min_edge_thresh requires score_mode=prob_edge or edge_prob.")
@@ -715,8 +929,7 @@ def main() -> None:
         if p_move is not None and args.move_tau > 0.0:
             side[p_move < args.move_tau] = 0
 
-        size = None
-        if args.size_mode == "mu_over_sigma":
+        if size is None and args.size_mode == "mu_over_sigma":
             pos = mu_r / (sigma + 1e-12)
             if args.size_zero_k > 0.0:
                 pos = np.where(np.abs(mu_r) >= args.size_zero_k * sigma, pos, 0.0)
@@ -816,6 +1029,18 @@ def main() -> None:
                 )
 
     # Overall summary across all horizons (flattened)
+    all_valid = None
+    all_side = None
+    all_size = None
+    all_pnl = None
+    all_gross = None
+    all_cost = None
+    all_time = None
+    all_time_hours = None
+    all_edge = None
+    all_bucket = None
+    all_hold = None
+    all_series = None
     if overall_valid_list:
         all_valid = np.concatenate(overall_valid_list, axis=0)
         all_side = np.concatenate(overall_side_list, axis=0)
@@ -875,6 +1100,52 @@ def main() -> None:
                 ]
             )
             writer.writerows(trades_rows)
+
+    if args.out_asset and all_valid is not None and all_series is not None:
+        out_asset = Path(args.out_asset)
+        out_asset.parent.mkdir(parents=True, exist_ok=True)
+        with out_asset.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "series_idx",
+                    "n_trades",
+                    "trade_rate",
+                    "hit_rate",
+                    "mean_pnl_trade",
+                    "net_pnl_sum",
+                    "gross_exposure_mean",
+                ]
+            )
+            for s_idx in np.unique(all_series):
+                idx = (all_series == s_idx) & (all_valid > 0)
+                if not np.any(idx):
+                    continue
+                trade = idx & (all_side != 0)
+                n_valid = int(np.sum(idx))
+                n_trades = int(np.sum(trade))
+                trade_rate = n_trades / max(n_valid, 1)
+                if n_trades:
+                    hit_rate = float(np.mean(all_pnl[trade] > 0))
+                    mean_pnl = float(np.mean(all_pnl[trade]))
+                    net_pnl = float(np.sum(all_pnl[trade]))
+                    gross_exposure_mean = float(np.mean(np.abs(all_size[trade] * all_side[trade])))
+                else:
+                    hit_rate = float("nan")
+                    mean_pnl = float("nan")
+                    net_pnl = 0.0
+                    gross_exposure_mean = float("nan")
+                writer.writerow(
+                    [
+                        int(s_idx),
+                        n_trades,
+                        trade_rate,
+                        hit_rate,
+                        mean_pnl,
+                        net_pnl,
+                        gross_exposure_mean,
+                    ]
+                )
 
     all_row = next((row for row in summaries if row.get("scope") == "all"), None)
     if all_row is not None:

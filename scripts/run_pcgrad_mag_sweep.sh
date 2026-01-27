@@ -25,7 +25,7 @@ mkdir -p "${CFG_DIR}"
 mkdir -p artifacts/sweep
 
 if [ ! -f "${SUMMARY}" ]; then
-  echo "run_name,seed,lambda_dir,mag_weight_power,checkpoint_tag,checkpoint,config,mae,pinball,coverage90,width90,aci_coverage90,aci_width90,dir_wMCC,dir_wAUC,dir_acc_mean,dir_ece_mean,dir_mcc_mean,dir_auc_mean,bin_max_acc,bin_max_mcc,bin_max_auc,boot_h1_acc,boot_h1_mcc,boot_h24_acc,boot_h24_mcc" > "${SUMMARY}"
+  echo "run_name,seed,lambda_dir,mag_weight_power,checkpoint_tag,checkpoint,config,mae,pinball,coverage80,width80,aci_coverage80,aci_width80,dir_wMCC,dir_wAUC,dir_acc_mean,dir_ece_mean,dir_mcc_mean,dir_auc_mean,bin_max_acc,bin_max_mcc,bin_max_auc,boot_h1_acc,boot_h1_mcc,boot_h24_acc,boot_h24_mcc" > "${SUMMARY}"
 fi
 
 if command -v rg >/dev/null 2>&1; then
@@ -284,10 +284,10 @@ for tag in ("best_loss", "best_dir", "last"):
         cfg,
         fore.get("mae"),
         fore.get("pinball"),
-        fore.get("coverage90"),
-        fore.get("width90"),
-        aci.get("coverage90"),
-        aci.get("width90"),
+        fore.get("coverage80"),
+        fore.get("width80"),
+        aci.get("coverage80"),
+        aci.get("width80"),
         dir_m.get("dirscore_wMCC"),
         dir_m.get("dirscore_wAUC"),
         dir_m.get("dir_acc_mean"),

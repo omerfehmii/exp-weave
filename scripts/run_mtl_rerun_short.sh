@@ -11,7 +11,7 @@ SUMMARY="${OUT_ROOT}/summary.csv"
 mkdir -p "${OUT_ROOT}"
 
 if [ ! -f "${SUMMARY}" ]; then
-  echo "run_name,config,checkpoint_best,checkpoint_last,best_epoch,last_epoch,preds_hash_best,preds_hash_last,best_mae,best_pinball_q10,best_pinball_q50,best_pinball_q90,best_coverage90,best_width90,best_aci_coverage90,best_aci_width90,best_dir_wMCC,best_dir_wAUC,best_dir_acc_mean,best_dir_mcc_mean,best_dir_auc_mean,best_boot_h1_acc,best_boot_h1_mcc,best_boot_h24_acc,best_boot_h24_mcc,last_mae,last_pinball_q10,last_pinball_q50,last_pinball_q90,last_coverage90,last_width90,last_aci_coverage90,last_aci_width90,last_dir_wMCC,last_dir_wAUC,last_dir_acc_mean,last_dir_mcc_mean,last_dir_auc_mean,last_boot_h1_acc,last_boot_h1_mcc,last_boot_h24_acc,last_boot_h24_mcc" > "${SUMMARY}"
+  echo "run_name,config,checkpoint_best,checkpoint_last,best_epoch,last_epoch,preds_hash_best,preds_hash_last,best_mae,best_pinball_q10,best_pinball_q50,best_pinball_q90,best_coverage80,best_width80,best_aci_coverage80,best_aci_width80,best_dir_wMCC,best_dir_wAUC,best_dir_acc_mean,best_dir_mcc_mean,best_dir_auc_mean,best_boot_h1_acc,best_boot_h1_mcc,best_boot_h24_acc,best_boot_h24_mcc,last_mae,last_pinball_q10,last_pinball_q50,last_pinball_q90,last_coverage80,last_width80,last_aci_coverage80,last_aci_width80,last_dir_wMCC,last_dir_wAUC,last_dir_acc_mean,last_dir_mcc_mean,last_dir_auc_mean,last_boot_h1_acc,last_boot_h1_mcc,last_boot_h24_acc,last_boot_h24_mcc" > "${SUMMARY}"
 fi
 
 if command -v rg >/dev/null 2>&1; then
@@ -232,10 +232,10 @@ row = [
     pins_b.get("q10"),
     pins_b.get("q50"),
     pins_b.get("q90"),
-    fore_b.get("coverage90"),
-    fore_b.get("width90"),
-    aci_b.get("coverage90"),
-    aci_b.get("width90"),
+    fore_b.get("coverage80"),
+    fore_b.get("width80"),
+    aci_b.get("coverage80"),
+    aci_b.get("width80"),
     dir_b.get("dirscore_wMCC"),
     dir_b.get("dirscore_wAUC"),
     dir_b.get("dir_acc_mean"),
@@ -249,10 +249,10 @@ row = [
     pins_l.get("q10"),
     pins_l.get("q50"),
     pins_l.get("q90"),
-    fore_l.get("coverage90"),
-    fore_l.get("width90"),
-    aci_l.get("coverage90"),
-    aci_l.get("width90"),
+    fore_l.get("coverage80"),
+    fore_l.get("width80"),
+    aci_l.get("coverage80"),
+    aci_l.get("width80"),
     dir_l.get("dirscore_wMCC"),
     dir_l.get("dirscore_wAUC"),
     dir_l.get("dir_acc_mean"),

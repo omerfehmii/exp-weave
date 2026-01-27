@@ -24,6 +24,13 @@ def _is_finite(x: float) -> bool:
     return not (math.isnan(x) or math.isinf(x))
 
 
+def _row_float(row: dict, key: str, legacy_key: str | None = None) -> float:
+    val = row.get(key)
+    if (val is None or str(val).strip() == "") and legacy_key:
+        val = row.get(legacy_key)
+    return _to_float(val)
+
+
 def load_candidates(summary_path: Path) -> list[dict]:
     with summary_path.open() as f:
         rows = list(csv.DictReader(f))
@@ -42,10 +49,10 @@ def load_candidates(summary_path: Path) -> list[dict]:
                 "tag": tag,
                 "mae": _to_float(row.get(prefix + "mae")),
                 "pinball": _to_float(row.get(prefix + "pinball")),
-                "coverage90": _to_float(row.get(prefix + "coverage90")),
-                "width90": _to_float(row.get(prefix + "width90")),
-                "aci_coverage90": _to_float(row.get(prefix + "aci_coverage90")),
-                "aci_width90": _to_float(row.get(prefix + "aci_width90")),
+                "coverage80": _row_float(row, prefix + "coverage80", prefix + "coverage90"),
+                "width80": _row_float(row, prefix + "width80", prefix + "width90"),
+                "aci_coverage80": _row_float(row, prefix + "aci_coverage80", prefix + "aci_coverage90"),
+                "aci_width80": _row_float(row, prefix + "aci_width80", prefix + "aci_width90"),
                 "dir_wMCC": _to_float(row.get(prefix + "dir_wMCC")),
                 "dir_wAUC": _to_float(row.get(prefix + "dir_wAUC")),
                 "dir_acc_mean": _to_float(row.get(prefix + "dir_acc_mean")),
@@ -80,13 +87,13 @@ def main() -> None:
 
     filtered = []
     for c in candidates:
-        if not (_is_finite(c["mae"]) and _is_finite(c["pinball"]) and _is_finite(c["aci_coverage90"]) and _is_finite(c["dir_wMCC"])):
+        if not (_is_finite(c["mae"]) and _is_finite(c["pinball"]) and _is_finite(c["aci_coverage80"]) and _is_finite(c["dir_wMCC"])):
             continue
         if c["mae"] > args.budget_mae_mult * baseline_mae:
             continue
         if c["pinball"] > args.budget_pinball_mult * baseline_pinball:
             continue
-        if not (args.aci_min <= c["aci_coverage90"] <= args.aci_max):
+        if not (args.aci_min <= c["aci_coverage80"] <= args.aci_max):
             continue
         filtered.append(c)
 
@@ -99,7 +106,7 @@ def main() -> None:
 
     print("selected", best["run_name"], best["tag"])
     print("checkpoint", best["checkpoint"])
-    print("mae", best["mae"], "pinball", best["pinball"], "aci_cov", best["aci_coverage90"])
+    print("mae", best["mae"], "pinball", best["pinball"], "aci_cov", best["aci_coverage80"])
     print("dir_wMCC", best["dir_wMCC"], "dir_wAUC", best["dir_wAUC"], "dir_acc", best["dir_acc_mean"])
 
     if args.output_json:

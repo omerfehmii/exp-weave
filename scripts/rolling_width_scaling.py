@@ -30,8 +30,8 @@ def _metrics(y: np.ndarray, q10: np.ndarray, q50: np.ndarray, q90: np.ndarray, m
     return {
         "mae": mae,
         "rmse": rmse,
-        "coverage90": _masked_coverage(y, q10, q90, mask),
-        "width90": _masked_width(q10, q90, mask),
+        "coverage80": _masked_coverage(y, q10, q90, mask),
+        "width80": _masked_width(q10, q90, mask),
     }
 
 

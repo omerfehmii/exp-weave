@@ -8,7 +8,8 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Sampler
 
 from backtest.harness import generate_panel_origins, make_time_splits, select_indices_by_time
 from data.loader import SeriesData, WindowedDataset, load_panel_npz, compress_series_observed
@@ -378,6 +379,39 @@ def default_horizon_weights(H: int) -> np.ndarray:
     return weights
 
 
+class TimestampBatchSampler(Sampler[List[int]]):
+    def __init__(
+        self,
+        indices: List[tuple],
+        min_assets: int = 5,
+        max_assets: int = 0,
+        shuffle: bool = True,
+        seed: int = 7,
+    ) -> None:
+        self.max_assets = max_assets
+        self.shuffle = shuffle
+        self.rng = np.random.RandomState(seed)
+        by_t: Dict[int, List[int]] = {}
+        for i, (_, t) in enumerate(indices):
+            by_t.setdefault(int(t), []).append(i)
+        self.groups = [g for g in by_t.values() if len(g) >= min_assets]
+
+    def __iter__(self):
+        order = np.arange(len(self.groups))
+        if self.shuffle:
+            self.rng.shuffle(order)
+        for idx in order:
+            g = self.groups[idx]
+            if self.max_assets and len(g) > self.max_assets:
+                sel = self.rng.choice(g, size=self.max_assets, replace=False)
+                yield sel.tolist()
+            else:
+                yield g
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -438,8 +472,36 @@ def main() -> None:
         target_log_eps=target_log_eps,
     )
     batch_size = cfg["training"].get("batch_size", 32)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    cs_batch_cfg = cfg.get("training", {}).get("cs_batching", {})
+    cs_batch_enabled = bool(cs_batch_cfg.get("enabled", False))
+    cs_batch_min_assets = int(cs_batch_cfg.get("min_assets", 5))
+    cs_batch_max_assets = int(cs_batch_cfg.get("max_assets", 0))
+    cs_batch_shuffle = bool(cs_batch_cfg.get("shuffle", True))
+    cs_batch_val = bool(cs_batch_cfg.get("val_enabled", False))
+    if cs_batch_enabled:
+        train_sampler = TimestampBatchSampler(
+            train_idx,
+            min_assets=cs_batch_min_assets,
+            max_assets=cs_batch_max_assets,
+            shuffle=cs_batch_shuffle,
+            seed=seed,
+        )
+        train_loader = DataLoader(train_ds, batch_sampler=train_sampler)
+        if cs_batch_val:
+            val_sampler = TimestampBatchSampler(
+                val_idx,
+                min_assets=cs_batch_min_assets,
+                max_assets=cs_batch_max_assets,
+                shuffle=False,
+                seed=seed,
+            )
+            val_loader = DataLoader(val_ds, batch_sampler=val_sampler)
+        else:
+            val_loader = DataLoader(val_ds, batch_size=batch_size)
+        print(f"cs_batching enabled: train_groups={len(train_sampler)} val_groups={len(val_sampler) if cs_batch_val else 'n/a'}")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size)
 
     model = build_model(cfg)
     device = torch.device(cfg["training"].get("device", "cpu"))
@@ -524,6 +586,15 @@ def main() -> None:
     gate_entropy_weight = float(gate_cfg.get("entropy_weight", 0.0))
     moe_entropy_weight = float(loss_cfg.get("moe_entropy_weight", 0.0))
     moe_balance_weight = float(loss_cfg.get("moe_balance_weight", 0.0))
+    cs_label = bool(cfg.get("training", {}).get("cs_label", False))
+    cs_label_val = bool(cfg.get("training", {}).get("cs_label_val", False))
+    cs_rank_cfg = cfg.get("training", {}).get("cs_rank", {})
+    cs_rank_enabled = bool(cs_rank_cfg.get("enabled", False))
+    cs_rank_weight = float(cs_rank_cfg.get("weight", 0.0))
+    cs_rank_h = int(cs_rank_cfg.get("horizon", cfg["data"]["H"]))
+    cs_rank_min_diff = float(cs_rank_cfg.get("min_diff", 0.0))
+    cs_rank_use_residual = bool(cs_rank_cfg.get("use_residual", True))
+    warned_cs_label = False
 
     mt_cfg = cfg.get("training", {}).get("multi_task", {})
     mt_mode = str(mt_cfg.get("mode", "none")).lower()
@@ -583,27 +654,45 @@ def main() -> None:
         total_loss = 0.0
         running_loss = 0.0
         running_samples = 0
+        rank_loss_sum = 0.0
+        rank_batches = 0
         last_log_time = time.time()
         for batch_idx, (batch, target) in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             target = target.to(device)
             q_hat, extras = model(batch)
-            y_true = target[..., 0]
-            mask = torch.isfinite(y_true).float()
+            y_true_raw = target[..., 0]
+            mask = torch.isfinite(y_true_raw).float()
             origin_mask = batch["mask"][:, -1, 0]
             mask_dir = mask * origin_mask[:, None]
-            y_true = torch.nan_to_num(y_true, nan=0.0)
-            main_loss = pinball_weight * masked_pinball_loss_torch(y_true, q_hat, quantiles, mask, quantile_weights)
+            y_true = torch.nan_to_num(y_true_raw, nan=0.0)
+            q_hat_main = q_hat
+            y_true_main = y_true
+            y_true_cs = None
+            if cs_batch_enabled and (cs_label or cs_rank_use_residual):
+                denom_cs = torch.clamp(mask.sum(dim=0), min=1.0)
+                y_mean = torch.sum(y_true * mask, dim=0) / denom_cs
+                y_true_cs = y_true - y_mean
+                if cs_label:
+                    q_mean = torch.sum(q_hat * mask.unsqueeze(-1), dim=0) / denom_cs.unsqueeze(-1)
+                    q_hat_main = q_hat - q_mean
+                    y_true_main = y_true_cs
+            elif cs_label and not warned_cs_label:
+                print("warning: cs_label enabled but cs_batching disabled; skipping cs_label.")
+                warned_cs_label = True
+            main_loss = pinball_weight * masked_pinball_loss_torch(y_true_main, q_hat_main, quantiles, mask, quantile_weights)
             if mae_weight > 0:
                 denom = torch.clamp(mask.sum(), min=1.0)
-                main_loss = main_loss + mae_weight * (torch.sum(torch.abs(y_true - q_hat[..., q50_idx]) * mask) / denom)
+                main_loss = main_loss + mae_weight * (
+                    torch.sum(torch.abs(y_true_main - q_hat_main[..., q50_idx]) * mask) / denom
+                )
             if width_min_weight > 0 and width_min > 0 and q10_idx is not None and q90_idx is not None:
-                width = q_hat[..., q90_idx] - q_hat[..., q10_idx]
+                width = q_hat_main[..., q90_idx] - q_hat_main[..., q10_idx]
                 width_pen = torch.relu(width_min - width) * mask
                 denom = torch.clamp(mask.sum(), min=1.0)
                 main_loss = main_loss + width_min_weight * (width_pen.sum() / denom)
             if repulsion_weight > 0 and q10_idx is not None and q90_idx is not None:
-                width = q_hat[..., q90_idx] - q_hat[..., q10_idx]
+                width = q_hat_main[..., q90_idx] - q_hat_main[..., q10_idx]
                 repulsion = torch.exp(-width / max(repulsion_scale, 1e-6)) * mask
                 denom = torch.clamp(mask.sum(), min=1.0)
                 main_loss = main_loss + repulsion_weight * (repulsion.sum() / denom)
@@ -634,6 +723,40 @@ def main() -> None:
                     target = torch.full_like(mean_w, 1.0 / mean_w.shape[0])
                     balance = torch.sum((mean_w - target) ** 2)
                     main_loss = main_loss + moe_balance_weight * balance
+            if cs_rank_enabled and cs_rank_weight > 0.0:
+                if not cs_batch_enabled:
+                    if not warned_cs_label:
+                        print("warning: cs_rank enabled but cs_batching disabled; skipping cs_rank.")
+                        warned_cs_label = True
+                else:
+                    h_idx = max(0, min(cs_rank_h, y_true.shape[1]) - 1)
+                    pred_rank = q_hat[..., q50_idx][:, h_idx]
+                    if cs_rank_use_residual:
+                        if y_true_cs is None:
+                            denom_cs = torch.clamp(mask.sum(dim=0), min=1.0)
+                            y_mean = torch.sum(y_true * mask, dim=0) / denom_cs
+                            y_true_cs = y_true - y_mean
+                        label_rank = y_true_cs[:, h_idx]
+                        pred_rank = pred_rank - pred_rank.mean()
+                    else:
+                        label_rank = y_true[:, h_idx]
+                    valid_rank = mask[:, h_idx] > 0
+                    pred_rank = pred_rank[valid_rank]
+                    label_rank = label_rank[valid_rank]
+                    if pred_rank.numel() > 1:
+                        idx = torch.triu_indices(pred_rank.numel(), pred_rank.numel(), 1, device=device)
+                        diff = pred_rank[idx[0]] - pred_rank[idx[1]]
+                        label_diff = label_rank[idx[0]] - label_rank[idx[1]]
+                        if cs_rank_min_diff > 0:
+                            keep = torch.abs(label_diff) >= cs_rank_min_diff
+                        else:
+                            keep = label_diff != 0
+                        if torch.any(keep):
+                            sign = torch.sign(label_diff[keep])
+                            rank_loss = F.softplus(-sign * diff[keep]).mean()
+                            main_loss = main_loss + cs_rank_weight * rank_loss
+                            rank_loss_sum += float(rank_loss.item())
+                            rank_batches += 1
             dir_loss_total = None
             if dir_enabled:
                 y_last = batch["y_past"][:, -1, 0]
@@ -809,12 +932,16 @@ def main() -> None:
                 running_loss = 0.0
                 running_samples = 0
                 last_log_time = time.time()
+        if rank_batches > 0:
+            print(f"train_rank_loss={rank_loss_sum / max(rank_batches, 1):.4f}")
         model.eval()
         val_loss = 0.0
         val_dir_loss = 0.0
         val_cov = 0.0
         val_width = 0.0
         cov_batches = 0
+        val_rank_sum = 0.0
+        val_rank_batches = 0
         dir_batches = 0
         dir_tp = None
         dir_tn = None
@@ -830,10 +957,26 @@ def main() -> None:
                 batch = {k: v.to(device) for k, v in batch.items()}
                 target = target.to(device)
                 q_hat, extras = model(batch)
-                y_true = target[..., 0]
-                mask = torch.isfinite(y_true).float()
-                y_true = torch.nan_to_num(y_true, nan=0.0)
-                val_main = pinball_weight * masked_pinball_loss_torch(y_true, q_hat, quantiles, mask, quantile_weights)
+                y_true_raw = target[..., 0]
+                mask = torch.isfinite(y_true_raw).float()
+                y_true = torch.nan_to_num(y_true_raw, nan=0.0)
+                q_hat_main = q_hat
+                y_true_main = y_true
+                y_true_cs = None
+                use_cs_val = (cs_label and cs_batch_val) or cs_label_val
+                if use_cs_val:
+                    if not cs_batch_val:
+                        if not warned_cs_label:
+                            print("warning: cs_label_val enabled but cs_batching.val_enabled is False; skipping cs_label_val.")
+                            warned_cs_label = True
+                    else:
+                        denom_cs = torch.clamp(mask.sum(dim=0), min=1.0)
+                        y_mean = torch.sum(y_true * mask, dim=0) / denom_cs
+                        y_true_cs = y_true - y_mean
+                        q_mean = torch.sum(q_hat * mask.unsqueeze(-1), dim=0) / denom_cs.unsqueeze(-1)
+                        q_hat_main = q_hat - q_mean
+                        y_true_main = y_true_cs
+                val_main = pinball_weight * masked_pinball_loss_torch(y_true_main, q_hat_main, quantiles, mask, quantile_weights)
                 if cumret24_weight_used > 0:
                     if "cumret24" not in extras:
                         raise RuntimeError("cumret24_weight>0 but model did not return cumret24. Enable cumret24_head.")
@@ -847,6 +990,34 @@ def main() -> None:
                     denom = torch.clamp(mask_h.sum(), min=1.0)
                     cumret_loss = torch.sum((pred_h - target_h) ** 2 * mask_h) / denom
                     val_main = val_main + cumret24_weight_used * cumret_loss
+                if cs_rank_enabled and cs_rank_weight > 0.0 and cs_batch_val:
+                    h_idx = max(0, min(cs_rank_h, y_true.shape[1]) - 1)
+                    pred_rank = q_hat[..., q50_idx][:, h_idx]
+                    if cs_rank_use_residual:
+                        if y_true_cs is None:
+                            denom_cs = torch.clamp(mask.sum(dim=0), min=1.0)
+                            y_mean = torch.sum(y_true * mask, dim=0) / denom_cs
+                            y_true_cs = y_true - y_mean
+                        label_rank = y_true_cs[:, h_idx]
+                        pred_rank = pred_rank - pred_rank.mean()
+                    else:
+                        label_rank = y_true[:, h_idx]
+                    valid_rank = mask[:, h_idx] > 0
+                    pred_rank = pred_rank[valid_rank]
+                    label_rank = label_rank[valid_rank]
+                    if pred_rank.numel() > 1:
+                        idx = torch.triu_indices(pred_rank.numel(), pred_rank.numel(), 1, device=device)
+                        diff = pred_rank[idx[0]] - pred_rank[idx[1]]
+                        label_diff = label_rank[idx[0]] - label_rank[idx[1]]
+                        if cs_rank_min_diff > 0:
+                            keep = torch.abs(label_diff) >= cs_rank_min_diff
+                        else:
+                            keep = label_diff != 0
+                        if torch.any(keep):
+                            sign = torch.sign(label_diff[keep])
+                            rank_loss = F.softplus(-sign * diff[keep]).mean()
+                            val_rank_sum += float(rank_loss.item())
+                            val_rank_batches += 1
                 val_loss += val_main.item()
                 if dir_enabled:
                     y_last = batch["y_past"][:, -1, 0]
@@ -964,6 +1135,8 @@ def main() -> None:
             print(f"val_dir_loss={val_dir_loss:.4f}")
         if val_dir_wmcc is not None:
             print(f"val_dir_wmcc={val_dir_wmcc:.4f}")
+        if val_rank_batches > 0:
+            print(f"val_rank_loss={val_rank_sum / max(val_rank_batches, 1):.4f}")
 
         if log_path is not None:
             record = {
@@ -974,6 +1147,8 @@ def main() -> None:
                 "loss": val_loss,
                 "epoch_time_s": epoch_time,
             }
+            if val_rank_batches > 0:
+                record["rank_loss"] = val_rank_sum / max(val_rank_batches, 1)
             if cov_batches > 0:
                 record["coverage80"] = val_cov
                 record["width80"] = val_width

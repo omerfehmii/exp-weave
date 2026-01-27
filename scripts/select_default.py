@@ -6,16 +6,30 @@ from typing import Dict, Optional
 import numpy as np
 
 
+TARGET_COVERAGE = 0.80
+MIN_COVERAGE = 0.78
+
+
 def _load_metrics(path: str) -> Dict[str, float]:
     data = np.load(path, allow_pickle=True)
     metrics = data["metrics"].item()
     return metrics
 
 
+def _metric(metrics: Dict[str, float], key: str, legacy_key: str) -> float:
+    if key in metrics:
+        return float(metrics[key])
+    if legacy_key in metrics:
+        return float(metrics[legacy_key])
+    return float("nan")
+
+
 def _score(metrics: Dict[str, float]) -> tuple[float, float, float, float]:
+    coverage = _metric(metrics, "coverage80", "coverage90")
+    width = _metric(metrics, "width80", "width90")
     return (
-        abs(metrics["coverage90"] - 0.90),
-        metrics["width90"],
+        abs(coverage - TARGET_COVERAGE),
+        width,
         metrics["pinball"],
         metrics["collapse"],
     )
@@ -34,7 +48,7 @@ def _s_stats(path: Optional[str]) -> Optional[Dict[str, float]]:
 def _eligible(metrics: Dict[str, float]) -> bool:
     if metrics.get("crossing", 0.0) > 0.0:
         return False
-    if metrics["coverage90"] < 0.88:
+    if _metric(metrics, "coverage80", "coverage90") < MIN_COVERAGE:
         return False
     return True
 
@@ -60,7 +74,7 @@ def main() -> None:
         perh_unstable = perh_stats["min"] < 0.2 or perh_stats["max"] > 2.0
 
     base_metrics = candidates["A_base"]["metrics"]
-    if _eligible(base_metrics) and abs(base_metrics["coverage90"] - 0.90) <= 0.01:
+    if _eligible(base_metrics) and abs(_metric(base_metrics, "coverage80", "coverage90") - TARGET_COVERAGE) <= 0.01:
         print("prod_default=A_base (coverage near target, simplest)")
         print("metrics", base_metrics)
         return

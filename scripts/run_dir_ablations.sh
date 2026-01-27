@@ -11,7 +11,7 @@ SUMMARY="${OUT_ROOT}/summary.csv"
 mkdir -p "${OUT_ROOT}"
 
 if [ ! -f "${SUMMARY}" ]; then
-  echo "run_name,config,checkpoint,forecast_mae,forecast_pinball,forecast_coverage90,forecast_width90,aci_mae,aci_coverage90,aci_width90,dir_wMCC,dir_wAUC,dir_acc_mean,dir_mcc_mean,dir_auc_mean,dir_tp_sum,dir_tn_sum,dir_fp_sum,dir_fn_sum,bin_max_acc,bin_max_mcc,bin_max_auc,boot_h1_acc,boot_h1_acc_lo,boot_h1_acc_hi,boot_h1_mcc,boot_h1_mcc_lo,boot_h1_mcc_hi,boot_h24_acc,boot_h24_acc_lo,boot_h24_acc_hi,boot_h24_mcc,boot_h24_mcc_lo,boot_h24_mcc_hi" > "${SUMMARY}"
+  echo "run_name,config,checkpoint,forecast_mae,forecast_pinball,forecast_coverage80,forecast_width80,aci_mae,aci_coverage80,aci_width80,dir_wMCC,dir_wAUC,dir_acc_mean,dir_mcc_mean,dir_auc_mean,dir_tp_sum,dir_tn_sum,dir_fp_sum,dir_fn_sum,bin_max_acc,bin_max_mcc,bin_max_auc,boot_h1_acc,boot_h1_acc_lo,boot_h1_acc_hi,boot_h1_mcc,boot_h1_mcc_lo,boot_h1_mcc_hi,boot_h24_acc,boot_h24_acc_lo,boot_h24_acc_hi,boot_h24_mcc,boot_h24_mcc_lo,boot_h24_mcc_hi" > "${SUMMARY}"
 fi
 
 RUNS=(
@@ -143,11 +143,11 @@ row = [
     ckpt,
     forecast.get("mae"),
     forecast.get("pinball"),
-    forecast.get("coverage90"),
-    forecast.get("width90"),
+    forecast.get("coverage80"),
+    forecast.get("width80"),
     aci.get("mae"),
-    aci.get("coverage90"),
-    aci.get("width90"),
+    aci.get("coverage80"),
+    aci.get("width80"),
     dir_m.get("dirscore_wMCC"),
     dir_m.get("dirscore_wAUC"),
     dir_m.get("dir_acc_mean"),
