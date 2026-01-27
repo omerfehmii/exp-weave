@@ -54,8 +54,13 @@ def main() -> None:
     parser.add_argument("--ret_cs", action="store_true")
     parser.add_argument("--topk", type=int, default=0)
     parser.add_argument("--ema_halflife", type=float, default=0.0)
+    parser.add_argument("--ema_halflife_min", type=float, default=0.0)
+    parser.add_argument("--ema_halflife_max", type=float, default=0.0)
+    parser.add_argument("--ema_disp_lo", type=float, default=0.0)
+    parser.add_argument("--ema_disp_hi", type=float, default=0.0)
     parser.add_argument("--min_hold", type=int, default=0)
     parser.add_argument("--turnover_cap", type=float, default=0.0)
+    parser.add_argument("--turnover_budget", type=float, default=0.0)
     parser.add_argument("--walk_folds", type=int, default=0)
     parser.add_argument("--out_csv", default=None)
     args = parser.parse_args()
@@ -116,6 +121,11 @@ def main() -> None:
     prev_w = np.zeros(n_series, dtype=np.float64)
     hold = np.zeros(n_series, dtype=np.int64)
     ema_state = np.zeros(n_series, dtype=np.float64)
+    use_dynamic_ema = (
+        args.ema_halflife_min > 0
+        and args.ema_halflife_max > 0
+        and args.ema_disp_hi > args.ema_disp_lo
+    )
     if args.ema_halflife and args.ema_halflife > 0:
         alpha = 1.0 - 0.5 ** (1.0 / args.ema_halflife)
     else:
@@ -133,9 +143,20 @@ def main() -> None:
         if args.ret_cs:
             ret_t = ret_t - np.mean(ret_t)
         assets = series_idx[idx]
-        if alpha is not None:
+        alpha_t = alpha
+        if use_dynamic_ema:
+            disp = float(np.std(mu_t))
+            if disp <= args.ema_disp_lo:
+                hl = args.ema_halflife_max
+            elif disp >= args.ema_disp_hi:
+                hl = args.ema_halflife_min
+            else:
+                frac = (disp - args.ema_disp_lo) / (args.ema_disp_hi - args.ema_disp_lo)
+                hl = args.ema_halflife_max - frac * (args.ema_halflife_max - args.ema_halflife_min)
+            alpha_t = 1.0 - 0.5 ** (1.0 / max(hl, 1e-6))
+        if alpha_t is not None and alpha_t > 0:
             for j, a in enumerate(assets):
-                ema_state[a] = (1.0 - alpha) * ema_state[a] + alpha * mu_t[j]
+                ema_state[a] = (1.0 - alpha_t) * ema_state[a] + alpha_t * mu_t[j]
                 mu_t[j] = ema_state[a]
         if args.topk and args.topk > 0:
             k = int(args.topk)
@@ -176,6 +197,12 @@ def main() -> None:
             delta = w_full - prev_w
             delta = np.clip(delta, -args.turnover_cap, args.turnover_cap)
             w_full = prev_w + delta
+        if args.turnover_budget and args.turnover_budget > 0:
+            delta = w_full - prev_w
+            total = np.sum(np.abs(delta))
+            if total > args.turnover_budget:
+                scale = args.turnover_budget / (total + 1e-12)
+                w_full = prev_w + delta * scale
         denom_full = np.sum(np.abs(w_full[assets]))
         if denom_full > 1e-12:
             w_full = w_full / denom_full
@@ -192,6 +219,10 @@ def main() -> None:
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
         print(f"turnover_mean={avg_turnover:.6f}")
+    if pnl_time.size > 1:
+        rho1 = float(np.corrcoef(pnl_time[:-1], pnl_time[1:])[0, 1])
+        neff = pnl_time.size * (1.0 - rho1) / (1.0 + rho1 + 1e-12)
+        print(f"pnl_rho1={rho1:.4f} pnl_n_eff={neff:.1f}")
 
     if args.walk_folds and args.walk_folds > 1 and pnl_time.size > 0:
         folds = int(args.walk_folds)
