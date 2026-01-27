@@ -751,6 +751,10 @@ def _compute_pca_loadings(
     if valid_cols <= k:
         return None
     X = X - np.mean(X, axis=0, keepdims=True)
+    if not np.isfinite(X).all():
+        return None
+    if np.all(np.abs(X) < 1e-12):
+        return None
     try:
         _, _, vt = np.linalg.svd(X, full_matrices=False)
     except np.linalg.LinAlgError:
