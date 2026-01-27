@@ -95,6 +95,7 @@ def main() -> None:
     parser.add_argument("--opt_dollar_neutral", action="store_true")
     parser.add_argument("--walk_folds", type=int, default=0)
     parser.add_argument("--out_csv", default=None)
+    parser.add_argument("--out_metrics", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -209,6 +210,8 @@ def main() -> None:
     if args.score_map:
         score_edges, score_vals = _load_score_map(Path(args.score_map))
     pnl_time = []
+    hhi_time = []
+    top10_time = []
     turnover_time = []
     for t in np.unique(time_key):
         idx = np.where((time_key == t) & valid)[0]
@@ -424,7 +427,13 @@ def main() -> None:
             target_gross = args.gross_target * gate_scale
             if gross > 1e-12:
                 w_full[assets] = w_full[assets] * (target_gross / gross)
-        pnl_time.append(float(np.sum(w_full[assets] * ret_t)))
+        w_now = w_full[assets]
+        pnl_time.append(float(np.sum(w_now * ret_t)))
+        if w_now.size:
+            hhi_time.append(float(np.sum(w_now * w_now)))
+            topk = 10 if w_now.size >= 10 else w_now.size
+            if topk > 0:
+                top10_time.append(float(np.sum(np.sort(np.abs(w_now))[-topk:])))
         turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
         prev_w = w_full
 
@@ -443,6 +452,13 @@ def main() -> None:
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
         print(f"turnover_mean={avg_turnover:.6f}")
+    if hhi_time:
+        hhi_arr = np.asarray(hhi_time, dtype=np.float64)
+        top10_arr = np.asarray(top10_time, dtype=np.float64)
+        print(
+            f"hhi_mean={float(np.mean(hhi_arr)):.6f} hhi_p90={float(np.percentile(hhi_arr, 90)):.6f} "
+            f"top10_mean={float(np.mean(top10_arr)):.6f} top10_p90={float(np.percentile(top10_arr, 90)):.6f}"
+        )
     if pnl_time.size > 1:
         rho1 = float(np.corrcoef(pnl_time[:-1], pnl_time[1:])[0, 1])
         neff = pnl_time.size * (1.0 - rho1) / (1.0 + rho1 + 1e-12)
@@ -484,6 +500,15 @@ def main() -> None:
             f.write("pnl\n")
             for v in pnl_time:
                 f.write(f"{v:.8f}\n")
+    if args.out_metrics:
+        out_path = Path(args.out_metrics)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            f.write("pnl,hhi,top10\n")
+            for i, v in enumerate(pnl_time):
+                h = hhi_time[i] if i < len(hhi_time) else float("nan")
+                t = top10_time[i] if i < len(top10_time) else float("nan")
+                f.write(f"{v:.8f},{h:.8f},{t:.8f}\n")
 
 
 def _load_score_map(path: Path) -> tuple[np.ndarray, np.ndarray]:
