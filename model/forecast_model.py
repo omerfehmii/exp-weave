@@ -61,6 +61,7 @@ class ModelConfig:
     head_type: str = "MONO"  # MONO, DUAL_PATH, LSQ, FREE
     head_delta_floor: float = 0.0
     head_lsq_s_min: float = 0.0
+    head_detach: bool = False
     mask_embedding: bool = True
     delta_t_mode: str = "MLP_LOG1P"  # MLP_LOG1P, BUCKET, NONE
     attn_logit_bias: str = "HARD_NEG_INF"  # HARD_NEG_INF or NONE
@@ -71,6 +72,9 @@ class ModelConfig:
     dir_head_type: str = "hierarchical"  # hierarchical or three_class
     dir_head_detach: bool = False
     dir_head_dropout: float = 0.0
+    rank_head_enabled: bool = False
+    rank_head_detach: bool = False
+    rank_head_dropout: float = 0.0
     cumret24_head: bool = False
     use_series_id: bool = False
     series_id_vocab: Optional[int] = None
@@ -178,6 +182,13 @@ class MultiScaleForecastModel(nn.Module):
             self.dir_logits3 = None
             self.dir_move = None
             self.dir_dir = None
+        self.rank_head_enabled = cfg.rank_head_enabled
+        if self.rank_head_enabled:
+            self.rank_dropout = nn.Dropout(cfg.rank_head_dropout) if cfg.rank_head_dropout > 0 else None
+            self.rank_head = nn.Linear(cfg.d_model, 1)
+        else:
+            self.rank_dropout = None
+            self.rank_head = None
         self.cumret24_head_enabled = cfg.cumret24_head
         if self.cumret24_head_enabled:
             self.cumret24_head = nn.Linear(cfg.d_model, 1)
@@ -312,15 +323,17 @@ class MultiScaleForecastModel(nn.Module):
                 cats_enabled_override=self.cfg.dual_path_uncertainty_cats,
                 return_attn=False,
             )
+            head_in = dec_masked.detach() if self.cfg.head_detach else dec_masked
+            uncert_in = dec_uncert.detach() if self.cfg.head_detach else dec_uncert
             if self.cfg.moe_enabled:
                 q_list = []
                 for head in self.expert_heads or []:
-                    q_list.append(head(dec_masked, dec_uncert))
-                q_hat, moe_weights, moe_logits = self._apply_moe(dec_masked, q_list, y_past, mask)
+                    q_list.append(head(head_in, uncert_in))
+                q_hat, moe_weights, moe_logits = self._apply_moe(head_in, q_list, y_past, mask)
                 extras["moe_weights"] = moe_weights
                 extras["moe_logits"] = moe_logits
             else:
-                q_hat = self.head(dec_masked, dec_uncert)
+                q_hat = self.head(head_in, uncert_in)
             if return_diagnostics:
                 extras["dec_out"] = dec_masked
                 extras["dec_out_uncert"] = dec_uncert
@@ -334,17 +347,25 @@ class MultiScaleForecastModel(nn.Module):
                 mem_weights=mem_weights,
                 return_attn=return_attn,
             )
+            head_in = dec_out.detach() if self.cfg.head_detach else dec_out
             if self.cfg.moe_enabled:
                 q_list = []
                 for head in self.expert_heads or []:
-                    q_list.append(head(dec_out))
-                q_hat, moe_weights, moe_logits = self._apply_moe(dec_out, q_list, y_past, mask)
+                    q_list.append(head(head_in))
+                q_hat, moe_weights, moe_logits = self._apply_moe(head_in, q_list, y_past, mask)
                 extras["moe_weights"] = moe_weights
                 extras["moe_logits"] = moe_logits
             else:
-                q_hat = self.head(dec_out)
+                q_hat = self.head(head_in)
             if return_diagnostics:
                 extras["dec_out"] = dec_out
+        if self.rank_head is not None:
+            rank_in = dec_masked if dual_path else dec_out
+            if self.cfg.rank_head_detach:
+                rank_in = rank_in.detach()
+            if self.rank_dropout is not None:
+                rank_in = self.rank_dropout(rank_in)
+            extras["rank_pred"] = self.rank_head(rank_in).squeeze(-1)
         if self.dir_head_enabled:
             dir_in = dec_masked if dual_path else dec_out
             if self.cfg.dir_head_detach:

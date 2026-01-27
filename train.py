@@ -140,6 +140,51 @@ def grad_norm(
     return torch.sqrt(torch.clamp(grad_norm_sq(grads, mask, device), min=0.0))
 
 
+def sample_pair_indices(
+    labels: torch.Tensor,
+    n_pairs: int,
+    strategy: str,
+    strat_bins: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if labels.numel() < 2:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    if n_pairs <= 0 or strategy == "all":
+        return torch.triu_indices(labels.numel(), labels.numel(), 1, device=device)
+    if strategy == "random":
+        i = torch.randint(0, labels.numel(), (n_pairs,), device=device)
+        j = torch.randint(0, labels.numel(), (n_pairs,), device=device)
+        keep = i != j
+        i = i[keep]
+        j = j[keep]
+        if i.numel() == 0:
+            return torch.empty((2, 0), dtype=torch.long, device=device)
+        return torch.stack([i, j], dim=0)
+    # stratified
+    n_bins = max(2, strat_bins)
+    order = torch.argsort(labels)
+    bins = torch.chunk(order, n_bins)
+    combos = []
+    for a in range(n_bins):
+        for b in range(a + 1, n_bins):
+            combos.append((a, b))
+    if not combos:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    per = max(1, n_pairs // len(combos))
+    pairs = []
+    for a, b in combos:
+        idx_a = bins[a]
+        idx_b = bins[b]
+        if idx_a.numel() == 0 or idx_b.numel() == 0:
+            continue
+        ia = idx_a[torch.randint(0, idx_a.numel(), (per,), device=device)]
+        ib = idx_b[torch.randint(0, idx_b.numel(), (per,), device=device)]
+        pairs.append(torch.stack([ia, ib], dim=0))
+    if not pairs:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    return torch.cat(pairs, dim=1)
+
+
 def mcc_from_counts(tp: np.ndarray, tn: np.ndarray, fp: np.ndarray, fn: np.ndarray) -> np.ndarray:
     denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
     out = np.full_like(denom, np.nan, dtype=np.float64)
@@ -236,6 +281,7 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
     gate_cfg = patch_cfg.get("gate", {})
     scale_drop_cfg = patch_cfg.get("scale_drop", {})
     dir_head_cfg = cfg.get("direction_head", {})
+    rank_head_cfg = model_cfg.get("rank_head", {})
     cumret_cfg = cfg.get("cumret24_head", {})
     cumret_enabled = False
     if isinstance(cumret_cfg, dict):
@@ -283,6 +329,7 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         head_type=head_cfg.get("type", "MONO"),
         head_delta_floor=head_cfg.get("delta_floor", 0.0),
         head_lsq_s_min=head_cfg.get("lsq_s_min", 0.0),
+        head_detach=bool(model_cfg.get("head_detach", False)),
         mask_embedding=missing_cfg.get("mask_embedding", True),
         delta_t_mode=delta_t_mode,
         attn_logit_bias=missing_cfg.get("attn_logit_bias", "HARD_NEG_INF"),
@@ -293,6 +340,9 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         dir_head_type=dir_head_cfg.get("type", "hierarchical"),
         dir_head_detach=dir_head_cfg.get("detach", False),
         dir_head_dropout=dir_head_cfg.get("dropout", 0.0),
+        rank_head_enabled=bool(rank_head_cfg.get("enabled", model_cfg.get("rank_head_enabled", False))),
+        rank_head_detach=bool(rank_head_cfg.get("detach", model_cfg.get("rank_head_detach", False))),
+        rank_head_dropout=float(rank_head_cfg.get("dropout", model_cfg.get("rank_head_dropout", 0.0))),
         cumret24_head=cumret_enabled,
         moe_enabled=bool(moe_cfg.get("enabled", False)),
         moe_gate_hidden=int(moe_cfg.get("gate_hidden", model_cfg.get("d_model", 256))),
@@ -594,6 +644,11 @@ def main() -> None:
     cs_rank_h = int(cs_rank_cfg.get("horizon", cfg["data"]["H"]))
     cs_rank_min_diff = float(cs_rank_cfg.get("min_diff", 0.0))
     cs_rank_use_residual = bool(cs_rank_cfg.get("use_residual", True))
+    cs_rank_sample_pairs = int(cs_rank_cfg.get("sample_pairs", 0))
+    cs_rank_sample_strategy = str(cs_rank_cfg.get("sample_strategy", "all")).lower()
+    cs_rank_strat_bins = int(cs_rank_cfg.get("strat_bins", 3))
+    if cs_rank_sample_strategy not in {"all", "random", "stratified"}:
+        raise ValueError(f"Unknown cs_rank.sample_strategy: {cs_rank_sample_strategy}")
     cs_rank_mode = str(cs_rank_cfg.get("mode", "always")).lower()
     cs_rank_alternate_every = int(cs_rank_cfg.get("alternate_every", 1))
     if cs_rank_mode not in {"always", "alternate"}:
@@ -755,7 +810,10 @@ def main() -> None:
                         warned_cs_label = True
                 else:
                     h_idx = max(0, min(cs_rank_h, y_true.shape[1]) - 1)
-                    pred_rank = q_hat[..., q50_idx][:, h_idx]
+                    if "rank_pred" in extras:
+                        pred_rank = extras["rank_pred"][:, h_idx]
+                    else:
+                        pred_rank = q_hat[..., q50_idx][:, h_idx]
                     if cs_rank_use_residual:
                         if y_true_cs is None:
                             denom_cs = torch.clamp(mask.sum(dim=0), min=1.0)
@@ -769,14 +827,24 @@ def main() -> None:
                     pred_rank = pred_rank[valid_rank]
                     label_rank = label_rank[valid_rank]
                     if pred_rank.numel() > 1:
-                        idx = torch.triu_indices(pred_rank.numel(), pred_rank.numel(), 1, device=device)
-                        diff = pred_rank[idx[0]] - pred_rank[idx[1]]
-                        label_diff = label_rank[idx[0]] - label_rank[idx[1]]
-                        if cs_rank_min_diff > 0:
-                            keep = torch.abs(label_diff) >= cs_rank_min_diff
+                        idx = sample_pair_indices(
+                            label_rank,
+                            cs_rank_sample_pairs,
+                            cs_rank_sample_strategy,
+                            cs_rank_strat_bins,
+                            device,
+                        )
+                        if idx.numel() == 0:
+                            diff = None
+                            label_diff = None
                         else:
-                            keep = label_diff != 0
-                        if torch.any(keep):
+                            diff = pred_rank[idx[0]] - pred_rank[idx[1]]
+                            label_diff = label_rank[idx[0]] - label_rank[idx[1]]
+                        if cs_rank_min_diff > 0:
+                            keep = torch.abs(label_diff) >= cs_rank_min_diff if label_diff is not None else None
+                        else:
+                            keep = label_diff != 0 if label_diff is not None else None
+                        if keep is not None and torch.any(keep):
                             sign = torch.sign(label_diff[keep])
                             rank_loss = F.softplus(-sign * diff[keep]).mean()
                             rank_loss_sum += float(rank_loss.item())
@@ -1057,7 +1125,10 @@ def main() -> None:
                     val_main = val_main + cumret24_weight_used * cumret_loss
                 if cs_rank_enabled and cs_rank_weight > 0.0 and cs_batch_val:
                     h_idx = max(0, min(cs_rank_h, y_true.shape[1]) - 1)
-                    pred_rank = q_hat[..., q50_idx][:, h_idx]
+                    if "rank_pred" in extras:
+                        pred_rank = extras["rank_pred"][:, h_idx]
+                    else:
+                        pred_rank = q_hat[..., q50_idx][:, h_idx]
                     if cs_rank_use_residual:
                         if y_true_cs is None:
                             denom_cs = torch.clamp(mask.sum(dim=0), min=1.0)
@@ -1071,14 +1142,24 @@ def main() -> None:
                     pred_rank = pred_rank[valid_rank]
                     label_rank = label_rank[valid_rank]
                     if pred_rank.numel() > 1:
-                        idx = torch.triu_indices(pred_rank.numel(), pred_rank.numel(), 1, device=device)
-                        diff = pred_rank[idx[0]] - pred_rank[idx[1]]
-                        label_diff = label_rank[idx[0]] - label_rank[idx[1]]
-                        if cs_rank_min_diff > 0:
-                            keep = torch.abs(label_diff) >= cs_rank_min_diff
+                        idx = sample_pair_indices(
+                            label_rank,
+                            cs_rank_sample_pairs,
+                            cs_rank_sample_strategy,
+                            cs_rank_strat_bins,
+                            device,
+                        )
+                        if idx.numel() == 0:
+                            diff = None
+                            label_diff = None
                         else:
-                            keep = label_diff != 0
-                        if torch.any(keep):
+                            diff = pred_rank[idx[0]] - pred_rank[idx[1]]
+                            label_diff = label_rank[idx[0]] - label_rank[idx[1]]
+                        if cs_rank_min_diff > 0:
+                            keep = torch.abs(label_diff) >= cs_rank_min_diff if label_diff is not None else None
+                        else:
+                            keep = label_diff != 0 if label_diff is not None else None
+                        if keep is not None and torch.any(keep):
                             sign = torch.sign(label_diff[keep])
                             rank_loss = F.softplus(-sign * diff[keep]).mean()
                             val_rank_sum += float(rank_loss.item())

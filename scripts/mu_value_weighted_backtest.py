@@ -53,6 +53,10 @@ def main() -> None:
     parser.add_argument("--use_cs", action="store_true")
     parser.add_argument("--ret_cs", action="store_true")
     parser.add_argument("--topk", type=int, default=0)
+    parser.add_argument("--ema_halflife", type=float, default=0.0)
+    parser.add_argument("--min_hold", type=int, default=0)
+    parser.add_argument("--turnover_cap", type=float, default=0.0)
+    parser.add_argument("--walk_folds", type=int, default=0)
     parser.add_argument("--out_csv", default=None)
     args = parser.parse_args()
 
@@ -108,17 +112,31 @@ def main() -> None:
     else:
         time_key = origin_t
 
+    n_series = int(np.max(series_idx)) + 1
+    prev_w = np.zeros(n_series, dtype=np.float64)
+    hold = np.zeros(n_series, dtype=np.int64)
+    ema_state = np.zeros(n_series, dtype=np.float64)
+    if args.ema_halflife and args.ema_halflife > 0:
+        alpha = 1.0 - 0.5 ** (1.0 / args.ema_halflife)
+    else:
+        alpha = None
     pnl_time = []
+    turnover_time = []
     for t in np.unique(time_key):
         idx = np.where((time_key == t) & valid)[0]
         if idx.size == 0:
             continue
-        mu_t = mu[idx]
-        ret_t = ret[idx]
+        mu_t = mu[idx].astype(np.float64, copy=True)
+        ret_t = ret[idx].astype(np.float64, copy=True)
         if args.use_cs:
             mu_t = mu_t - np.mean(mu_t)
         if args.ret_cs:
             ret_t = ret_t - np.mean(ret_t)
+        assets = series_idx[idx]
+        if alpha is not None:
+            for j, a in enumerate(assets):
+                ema_state[a] = (1.0 - alpha) * ema_state[a] + alpha * mu_t[j]
+                mu_t[j] = ema_state[a]
         if args.topk and args.topk > 0:
             k = int(args.topk)
             if idx.size < 2 * k:
@@ -142,7 +160,28 @@ def main() -> None:
         if denom <= 1e-12:
             continue
         w = w / denom
-        pnl_time.append(float(np.sum(w * ret_t)))
+        w_full = prev_w.copy()
+        w_full[assets] = w
+        if args.min_hold and args.min_hold > 0:
+            for a in assets:
+                if hold[a] > 0:
+                    w_full[a] = prev_w[a]
+                    hold[a] -= 1
+                else:
+                    if prev_w[a] == 0.0 and w_full[a] != 0.0:
+                        hold[a] = args.min_hold - 1
+                    elif prev_w[a] != 0.0 and np.sign(w_full[a]) != np.sign(prev_w[a]):
+                        hold[a] = args.min_hold - 1
+        if args.turnover_cap and args.turnover_cap > 0:
+            delta = w_full - prev_w
+            delta = np.clip(delta, -args.turnover_cap, args.turnover_cap)
+            w_full = prev_w + delta
+        denom_full = np.sum(np.abs(w_full[assets]))
+        if denom_full > 1e-12:
+            w_full = w_full / denom_full
+        pnl_time.append(float(np.sum(w_full[assets] * ret_t)))
+        turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
+        prev_w = w_full
 
     pnl_time = np.asarray(pnl_time, dtype=np.float64)
     print(
@@ -150,6 +189,25 @@ def main() -> None:
         f"cs={args.use_cs} ret_cs={args.ret_cs} topk={args.topk} n_times={pnl_time.size}"
     )
     _summarize("portfolio", pnl_time)
+    if turnover_time:
+        avg_turnover = float(np.mean(turnover_time))
+        print(f"turnover_mean={avg_turnover:.6f}")
+
+    if args.walk_folds and args.walk_folds > 1 and pnl_time.size > 0:
+        folds = int(args.walk_folds)
+        fold_size = max(1, pnl_time.size // folds)
+        print(f"walk_folds={folds} fold_size={fold_size}")
+        for i in range(folds):
+            start = i * fold_size
+            end = pnl_time.size if i == folds - 1 else (i + 1) * fold_size
+            chunk = pnl_time[start:end]
+            if chunk.size == 0:
+                continue
+            mean = float(np.mean(chunk))
+            std = float(np.std(chunk))
+            sharpe = mean / (std + 1e-12)
+            hit = float(np.mean(chunk > 0))
+            print(f"fold{i}: mean={mean:.6f} sharpe={sharpe:.3f} hit={hit:.3f} n={chunk.size}")
 
     if args.out_csv:
         out_path = Path(args.out_csv)
