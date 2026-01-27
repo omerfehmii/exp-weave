@@ -53,6 +53,15 @@ def main() -> None:
     parser.add_argument("--use_cs", action="store_true")
     parser.add_argument("--ret_cs", action="store_true")
     parser.add_argument("--topk", type=int, default=0)
+    parser.add_argument("--score_transform", default="none", choices=["none", "cs_zscore"])
+    parser.add_argument("--score_clip", type=float, default=0.0)
+    parser.add_argument("--pos_cap", type=float, default=0.0)
+    parser.add_argument("--gross_target", type=float, default=1.0)
+    parser.add_argument("--score_map", default=None)
+    parser.add_argument("--disp_metric", default="std", choices=["std", "p90p10"])
+    parser.add_argument("--disp_lo", type=float, default=0.0)
+    parser.add_argument("--disp_hi", type=float, default=0.0)
+    parser.add_argument("--disp_min_scale", type=float, default=0.0)
     parser.add_argument("--ema_halflife", type=float, default=0.0)
     parser.add_argument("--ema_halflife_min", type=float, default=0.0)
     parser.add_argument("--ema_halflife_max", type=float, default=0.0)
@@ -130,6 +139,10 @@ def main() -> None:
         alpha = 1.0 - 0.5 ** (1.0 / args.ema_halflife)
     else:
         alpha = None
+    score_edges = None
+    score_vals = None
+    if args.score_map:
+        score_edges, score_vals = _load_score_map(Path(args.score_map))
     pnl_time = []
     turnover_time = []
     for t in np.unique(time_key):
@@ -143,6 +156,14 @@ def main() -> None:
         if args.ret_cs:
             ret_t = ret_t - np.mean(ret_t)
         assets = series_idx[idx]
+        if args.score_transform == "cs_zscore":
+            std = np.std(mu_t)
+            if std > 1e-12:
+                mu_t = (mu_t - np.mean(mu_t)) / std
+        if args.score_clip and args.score_clip > 0:
+            mu_t = np.clip(mu_t, -args.score_clip, args.score_clip)
+        if score_edges is not None and score_vals is not None:
+            mu_t = _apply_score_map(mu_t, score_edges, score_vals)
         alpha_t = alpha
         if use_dynamic_ema:
             disp = float(np.std(mu_t))
@@ -158,6 +179,18 @@ def main() -> None:
             for j, a in enumerate(assets):
                 ema_state[a] = (1.0 - alpha_t) * ema_state[a] + alpha_t * mu_t[j]
                 mu_t[j] = ema_state[a]
+        if args.disp_hi > args.disp_lo:
+            if args.disp_metric == "p90p10":
+                disp = float(np.percentile(mu_t, 90) - np.percentile(mu_t, 10))
+            else:
+                disp = float(np.std(mu_t))
+            if disp <= args.disp_lo:
+                scale = args.disp_min_scale
+            elif disp >= args.disp_hi:
+                scale = 1.0
+            else:
+                scale = args.disp_min_scale + (disp - args.disp_lo) * (1.0 - args.disp_min_scale) / (args.disp_hi - args.disp_lo)
+            mu_t = mu_t * scale
         if args.topk and args.topk > 0:
             k = int(args.topk)
             if idx.size < 2 * k:
@@ -203,9 +236,15 @@ def main() -> None:
             if total > args.turnover_budget:
                 scale = args.turnover_budget / (total + 1e-12)
                 w_full = prev_w + delta * scale
+        if args.pos_cap and args.pos_cap > 0:
+            w_full = np.clip(w_full, -args.pos_cap, args.pos_cap)
         denom_full = np.sum(np.abs(w_full[assets]))
         if denom_full > 1e-12:
             w_full = w_full / denom_full
+        if args.gross_target and args.gross_target > 0:
+            gross = np.sum(np.abs(w_full[assets]))
+            if gross > 1e-12:
+                w_full[assets] = w_full[assets] * (args.gross_target / gross)
         pnl_time.append(float(np.sum(w_full[assets] * ret_t)))
         turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
         prev_w = w_full
@@ -228,6 +267,7 @@ def main() -> None:
         folds = int(args.walk_folds)
         fold_size = max(1, pnl_time.size // folds)
         print(f"walk_folds={folds} fold_size={fold_size}")
+        fold_stats = []
         for i in range(folds):
             start = i * fold_size
             end = pnl_time.size if i == folds - 1 else (i + 1) * fold_size
@@ -238,7 +278,19 @@ def main() -> None:
             std = float(np.std(chunk))
             sharpe = mean / (std + 1e-12)
             hit = float(np.mean(chunk > 0))
-            print(f"fold{i}: mean={mean:.6f} sharpe={sharpe:.3f} hit={hit:.3f} n={chunk.size}")
+            cum = np.cumsum(chunk)
+            peak = np.maximum.accumulate(cum)
+            max_dd = float(np.max(peak - cum)) if cum.size else float("nan")
+            fold_stats.append((mean, sharpe))
+            print(f"fold{i}: mean={mean:.6f} sharpe={sharpe:.3f} hit={hit:.3f} max_dd={max_dd:.6f} n={chunk.size}")
+        if fold_stats:
+            means = [m for m, _ in fold_stats]
+            sharpes = [s for _, s in fold_stats]
+            print(f"fold_mean_std={np.std(means):.6f} fold_sharpe_std={np.std(sharpes):.6f}")
+            total_pnl = float(np.sum(pnl_time))
+            best_fold = float(np.max([np.sum(pnl_time[i*fold_size:(pnl_time.size if i == folds - 1 else (i+1)*fold_size)]) for i in range(folds)]))
+            if total_pnl != 0:
+                print(f"pnl_dominance={best_fold/total_pnl:.3f}")
 
     if args.out_csv:
         out_path = Path(args.out_csv)
@@ -251,3 +303,20 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+def _load_score_map(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    data = np.loadtxt(path, delimiter=",", skiprows=1)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    edges = data[:, 0:2]
+    values = data[:, 2]
+    return edges, values
+
+
+def _apply_score_map(scores: np.ndarray, edges: np.ndarray, values: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(scores, dtype=np.float64)
+    for i, s in enumerate(scores):
+        idx = np.where((s >= edges[:, 0]) & (s < edges[:, 1]))[0]
+        if idx.size == 0:
+            idx = np.array([np.argmax(edges[:, 1])])
+        out[i] = values[int(idx[0])]
+    return out
