@@ -85,6 +85,14 @@ def main() -> None:
     parser.add_argument("--min_hold", type=int, default=0)
     parser.add_argument("--turnover_cap", type=float, default=0.0)
     parser.add_argument("--turnover_budget", type=float, default=0.0)
+    parser.add_argument("--optimize", action="store_true")
+    parser.add_argument("--opt_lambda", type=float, default=0.0)
+    parser.add_argument("--opt_kappa", type=float, default=0.0)
+    parser.add_argument("--opt_steps", type=int, default=20)
+    parser.add_argument("--opt_lr", type=float, default=0.0)
+    parser.add_argument("--opt_risk_window", type=int, default=0)
+    parser.add_argument("--opt_risk_eps", type=float, default=1.0e-6)
+    parser.add_argument("--opt_dollar_neutral", action="store_true")
     parser.add_argument("--walk_folds", type=int, default=0)
     parser.add_argument("--out_csv", default=None)
     args = parser.parse_args()
@@ -114,6 +122,35 @@ def main() -> None:
         scale_x=cfg["data"].get("scale_x", True),
         scale_y=cfg["data"].get("scale_y", True),
     )
+    risk_cache = None
+    if args.optimize and args.opt_risk_window > 1:
+        risk_cache = []
+        w = int(args.opt_risk_window)
+        for series in series_list:
+            y_hist = series.y.astype(np.float64)
+            if y_hist.ndim > 1:
+                y_hist = y_hist[:, 0]
+            y_hist = np.nan_to_num(y_hist, nan=0.0)
+            r = np.diff(y_hist)
+            if r.size == 0:
+                risk_cache.append(np.full_like(y_hist, 1.0, dtype=np.float64))
+                continue
+            csum = np.cumsum(r)
+            csum2 = np.cumsum(r * r)
+            sigma = np.zeros_like(y_hist, dtype=np.float64)
+            for t in range(y_hist.size):
+                start = max(0, t - w)
+                end = min(r.size, t)
+                if end <= start:
+                    sigma[t] = np.std(r[:end]) if end > 0 else 0.0
+                    continue
+                n = end - start
+                s1 = csum[end - 1] - (csum[start - 1] if start > 0 else 0.0)
+                s2 = csum2[end - 1] - (csum2[start - 1] if start > 0 else 0.0)
+                mean = s1 / max(n, 1)
+                var = max(s2 / max(n, 1) - mean * mean, 0.0)
+                sigma[t] = np.sqrt(var)
+            risk_cache.append(sigma)
     if args.value_scale == "orig":
         if use_return_target:
             y = pre.inverse_return(y)
@@ -320,31 +357,43 @@ def main() -> None:
         mu_t = mu_t * gate_scale
         gate_scale_sum += gate_scale
         gate_scale_count += 1
-        if args.topk and args.topk > 0:
-            k = int(args.topk)
-            if idx.size < 2 * k:
-                continue
-            order = np.argsort(mu_t)
-            bottom = order[:k]
-            top = order[-k:]
-            w = np.zeros_like(mu_t, dtype=np.float64)
-            if args.weight_mode == "abs":
-                w[top] = np.abs(mu_t[top])
-                w[bottom] = -np.abs(mu_t[bottom])
-            else:
-                w[top] = mu_t[top]
-                w[bottom] = mu_t[bottom]
+        if args.optimize:
+            w = _optimize_weights(
+                mu_t,
+                prev_w[assets],
+                assets,
+                int(t),
+                risk_cache,
+                args,
+            )
+            w_full = prev_w.copy()
+            w_full[assets] = w
         else:
-            if args.weight_mode == "abs":
-                w = np.abs(mu_t)
+            if args.topk and args.topk > 0:
+                k = int(args.topk)
+                if idx.size < 2 * k:
+                    continue
+                order = np.argsort(mu_t)
+                bottom = order[:k]
+                top = order[-k:]
+                w = np.zeros_like(mu_t, dtype=np.float64)
+                if args.weight_mode == "abs":
+                    w[top] = np.abs(mu_t[top])
+                    w[bottom] = -np.abs(mu_t[bottom])
+                else:
+                    w[top] = mu_t[top]
+                    w[bottom] = mu_t[bottom]
             else:
-                w = mu_t
-        denom = np.sum(np.abs(w))
-        if denom <= 1e-12:
-            continue
-        w = w / denom
-        w_full = prev_w.copy()
-        w_full[assets] = w
+                if args.weight_mode == "abs":
+                    w = np.abs(mu_t)
+                else:
+                    w = mu_t
+            denom = np.sum(np.abs(w))
+            if denom <= 1e-12:
+                continue
+            w = w / denom
+            w_full = prev_w.copy()
+            w_full[assets] = w
         if args.min_hold and args.min_hold > 0:
             for a in assets:
                 if hold[a] > 0:
@@ -465,6 +514,73 @@ def _parse_gate_weights(raw: str) -> tuple[float, float, float]:
     if total <= 0:
         return 1.0, 1.0, 1.0
     return vals[0] / total, vals[1] / total, vals[2] / total
+
+
+def _soft_threshold(x: np.ndarray, thr: float) -> np.ndarray:
+    return np.sign(x) * np.maximum(np.abs(x) - thr, 0.0)
+
+
+def _project_weights(
+    w: np.ndarray,
+    cap: float,
+    gross_target: float,
+    dollar_neutral: bool,
+) -> np.ndarray:
+    out = w.copy()
+    if dollar_neutral:
+        out = out - np.mean(out)
+    if cap and cap > 0:
+        out = np.clip(out, -cap, cap)
+    gross = np.sum(np.abs(out))
+    if gross_target and gross > 1e-12:
+        out = out * (gross_target / gross)
+    if dollar_neutral:
+        out = out - np.mean(out)
+    if cap and cap > 0:
+        out = np.clip(out, -cap, cap)
+    gross = np.sum(np.abs(out))
+    if gross_target and gross > 1e-12:
+        out = out * (gross_target / gross)
+    return out
+
+
+def _optimize_weights(
+    alpha: np.ndarray,
+    w_prev: np.ndarray,
+    assets: np.ndarray,
+    t_idx: int,
+    risk_cache: list | None,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    n = alpha.size
+    if n == 0:
+        return alpha
+    sigma2 = np.ones(n, dtype=np.float64)
+    if risk_cache is not None:
+        sig = np.zeros(n, dtype=np.float64)
+        for j, a in enumerate(assets):
+            if a < len(risk_cache) and t_idx < risk_cache[a].size:
+                sig[j] = risk_cache[a][t_idx]
+        if np.all(sig == 0):
+            sig = np.ones_like(sig)
+        fallback = np.nanmedian(sig) if np.isfinite(sig).any() else 1.0
+        sig = np.nan_to_num(sig, nan=fallback, posinf=fallback, neginf=fallback)
+        sigma2 = np.maximum(sig * sig, args.opt_risk_eps)
+    lam = max(args.opt_lambda, 0.0)
+    kappa = max(args.opt_kappa, 0.0)
+    if args.opt_lr and args.opt_lr > 0:
+        lr = args.opt_lr
+    else:
+        denom = 2.0 * lam * float(np.max(sigma2)) + 1.0
+        lr = 1.0 / denom
+    w = w_prev.copy()
+    for _ in range(max(args.opt_steps, 1)):
+        grad = alpha - 2.0 * lam * sigma2 * w
+        w = w + lr * grad
+        if kappa > 0:
+            w = w_prev + _soft_threshold(w - w_prev, kappa * lr)
+        w = _project_weights(w, args.pos_cap, args.gross_target, args.opt_dollar_neutral)
+    return w
 
 
 if __name__ == "__main__":
