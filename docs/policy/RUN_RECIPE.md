@@ -7,6 +7,13 @@ This file documents the exact commands used to reproduce the DynCap-2 results.
 - Preds: `runs/ens_w10_preds.npz`
 - Config: `runs/backtest_return.yaml`
 
+## Repro snapshot (recorded)
+- **Code commit (dyn cap switch):** `9d60171`
+- **Results commit (dyn cap results):** `9d54f58`
+- **Repo HEAD at last update:** `b317c5a`
+- **Data hash (SHA256):** `b8330c6a3543f9c99911971ab7c34bb224b9ffec10b272c06e9ec432d57b14a8`
+- **Preds hash (SHA256):** `a81ad8e1b6fbd729ebd77ada08ce731f2f13ab26abdf576f8a27d0a9c16ee607`
+
 If running locally, use your venv python:
 ```
 .venv/bin/python ...
