@@ -38,6 +38,7 @@ def main() -> None:
     q10 = np.zeros_like(base["q10"], dtype=np.float32)
     q50 = np.zeros_like(base["q50"], dtype=np.float32)
     q90 = np.zeros_like(base["q90"], dtype=np.float32)
+    q50_stack = []
 
     for w, path in zip(weights, args.preds):
         preds = np.load(path)
@@ -48,10 +49,16 @@ def main() -> None:
         q10 += w * preds["q10"]
         q50 += w * preds["q50"]
         q90 += w * preds["q90"]
+        q50_stack.append(preds["q50"].astype(np.float32))
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    q50_std = None
+    if q50_stack:
+        q50_std = np.std(np.stack(q50_stack, axis=0), axis=0)
     npz_kwargs = {"y": y, "q10": q10, "q50": q50, "q90": q90}
+    if q50_std is not None:
+        npz_kwargs["q50_std"] = q50_std
     if mask is not None:
         npz_kwargs["mask"] = mask
     if origin_t is not None:

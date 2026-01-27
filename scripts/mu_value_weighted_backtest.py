@@ -62,6 +62,15 @@ def main() -> None:
     parser.add_argument("--disp_lo", type=float, default=0.0)
     parser.add_argument("--disp_hi", type=float, default=0.0)
     parser.add_argument("--disp_min_scale", type=float, default=0.0)
+    parser.add_argument("--disp_hist_window", type=int, default=0)
+    parser.add_argument("--disp_flat_q_low", type=float, default=0.0)
+    parser.add_argument("--disp_flat_q_high", type=float, default=0.0)
+    parser.add_argument("--consistency_min", type=float, default=None)
+    parser.add_argument("--consistency_scale", type=float, default=0.0)
+    parser.add_argument("--disagree_q_low", type=float, default=0.0)
+    parser.add_argument("--disagree_q_high", type=float, default=0.0)
+    parser.add_argument("--disagree_hist_window", type=int, default=0)
+    parser.add_argument("--disagree_scale", type=float, default=0.0)
     parser.add_argument("--ema_halflife", type=float, default=0.0)
     parser.add_argument("--ema_halflife_min", type=float, default=0.0)
     parser.add_argument("--ema_halflife_max", type=float, default=0.0)
@@ -81,6 +90,7 @@ def main() -> None:
     preds = np.load(args.preds)
     y = preds["y"]
     q50 = preds["q50"]
+    q50_std = preds["q50_std"] if "q50_std" in preds else None
     mask = preds["mask"] if "mask" in preds else np.isfinite(y).astype(np.float32)
     origin_t = preds["origin_t"].astype(np.int64) if "origin_t" in preds else None
     series_idx = preds["series_idx"].astype(np.int64) if "series_idx" in preds else None
@@ -109,6 +119,7 @@ def main() -> None:
     h_idx = args.h - 1
     valid = mask[:, h_idx] > 0
     mu = q50[:, h_idx]
+    mu_std = q50_std[:, h_idx] if q50_std is not None else None
     ret = y[:, h_idx]
 
     if origin_t is None or series_idx is None:
@@ -130,6 +141,14 @@ def main() -> None:
     prev_w = np.zeros(n_series, dtype=np.float64)
     hold = np.zeros(n_series, dtype=np.int64)
     ema_state = np.zeros(n_series, dtype=np.float64)
+    prev_scores = np.full(n_series, np.nan, dtype=np.float64)
+    disp_hist = []
+    disagree_hist = []
+    gate_on = True
+    disagree_on = True
+    gated_flat = 0
+    gated_consistency = 0
+    gated_disagree = 0
     use_dynamic_ema = (
         args.ema_halflife_min > 0
         and args.ema_halflife_max > 0
@@ -164,9 +183,60 @@ def main() -> None:
             mu_t = np.clip(mu_t, -args.score_clip, args.score_clip)
         if score_edges is not None and score_vals is not None:
             mu_t = _apply_score_map(mu_t, score_edges, score_vals)
+        # dispersion (before EMA)
+        if args.disp_metric == "p90p10":
+            disp = float(np.percentile(mu_t, 90) - np.percentile(mu_t, 10))
+        else:
+            disp = float(np.std(mu_t))
+        if args.disp_hist_window > 0:
+            hist = disp_hist[-args.disp_hist_window :]
+        else:
+            hist = disp_hist
+        if args.disp_flat_q_low > 0:
+            if hist:
+                q_low = float(np.quantile(hist, args.disp_flat_q_low))
+                q_high = float(np.quantile(hist, args.disp_flat_q_high)) if args.disp_flat_q_high > 0 else q_low
+                if gate_on and disp <= q_low:
+                    gate_on = False
+                elif (not gate_on) and disp >= q_high:
+                    gate_on = True
+            disp_hist.append(disp)
+        else:
+            disp_hist.append(disp)
+        # disagreement gate (requires q50_std in preds)
+        if mu_std is not None and (args.disagree_q_low > 0 or args.disagree_q_high > 0):
+            u_t = float(np.mean(mu_std[idx]))
+            if args.disagree_hist_window > 0:
+                dhist = disagree_hist[-args.disagree_hist_window :]
+            else:
+                dhist = disagree_hist
+            if dhist:
+                q_hi = float(np.quantile(dhist, args.disagree_q_high)) if args.disagree_q_high > 0 else None
+                q_lo = float(np.quantile(dhist, args.disagree_q_low)) if args.disagree_q_low > 0 else None
+                if disagree_on and q_hi is not None and u_t >= q_hi:
+                    disagree_on = False
+                elif (not disagree_on) and q_lo is not None and u_t <= q_lo:
+                    disagree_on = True
+            disagree_hist.append(u_t)
+        # self-consistency gate
+        cons_scale = 1.0
+        if args.consistency_min is not None:
+            prev = prev_scores[assets]
+            valid_prev = np.isfinite(prev)
+            if np.sum(valid_prev) >= 2:
+                a = mu_t[valid_prev]
+                b = prev[valid_prev]
+                a = a - np.mean(a)
+                b = b - np.mean(b)
+                denom = (np.sqrt(np.sum(a * a) * np.sum(b * b)) + 1e-12)
+                corr = float(np.sum(a * b) / denom)
+                if corr < args.consistency_min:
+                    cons_scale = args.consistency_scale
+                    if cons_scale <= 0:
+                        gated_consistency += 1
+        prev_scores[assets] = mu_t
         alpha_t = alpha
         if use_dynamic_ema:
-            disp = float(np.std(mu_t))
             if disp <= args.ema_disp_lo:
                 hl = args.ema_halflife_max
             elif disp >= args.ema_disp_hi:
@@ -180,10 +250,6 @@ def main() -> None:
                 ema_state[a] = (1.0 - alpha_t) * ema_state[a] + alpha_t * mu_t[j]
                 mu_t[j] = ema_state[a]
         if args.disp_hi > args.disp_lo:
-            if args.disp_metric == "p90p10":
-                disp = float(np.percentile(mu_t, 90) - np.percentile(mu_t, 10))
-            else:
-                disp = float(np.std(mu_t))
             if disp <= args.disp_lo:
                 scale = args.disp_min_scale
             elif disp >= args.disp_hi:
@@ -191,6 +257,18 @@ def main() -> None:
             else:
                 scale = args.disp_min_scale + (disp - args.disp_lo) * (1.0 - args.disp_min_scale) / (args.disp_hi - args.disp_lo)
             mu_t = mu_t * scale
+        if not gate_on:
+            gated_flat += 1
+        if not disagree_on:
+            gated_disagree += 1
+        if (not gate_on) or (not disagree_on) or (cons_scale <= 0):
+            w_full = np.zeros_like(prev_w)
+            pnl_time.append(0.0)
+            turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
+            prev_w = w_full
+            continue
+        if cons_scale != 1.0:
+            mu_t = mu_t * cons_scale
         if args.topk and args.topk > 0:
             k = int(args.topk)
             if idx.size < 2 * k:
@@ -255,6 +333,8 @@ def main() -> None:
         f"cs={args.use_cs} ret_cs={args.ret_cs} topk={args.topk} n_times={pnl_time.size}"
     )
     _summarize("portfolio", pnl_time)
+    if pnl_time.size > 0:
+        print(f"gate_flat_frac={gated_flat / pnl_time.size:.3f} gate_disagree_frac={gated_disagree / pnl_time.size:.3f} gate_consistency_flat_frac={gated_consistency / pnl_time.size:.3f}")
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
         print(f"turnover_mean={avg_turnover:.6f}")
