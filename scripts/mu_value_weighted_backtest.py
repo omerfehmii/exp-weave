@@ -86,6 +86,9 @@ def main() -> None:
     parser.add_argument("--pca_min_obs", type=int, default=30)
     parser.add_argument("--topn_cap", type=float, default=0.0)
     parser.add_argument("--topn_n", type=int, default=10)
+    parser.add_argument("--topn_cap_low", type=float, default=0.0)
+    parser.add_argument("--topn_dyn_q_hi", type=float, default=0.0)
+    parser.add_argument("--topn_dyn_q_lo", type=float, default=0.0)
     parser.add_argument("--gate_combine", default="mul", choices=["mul", "min", "avg"])
     parser.add_argument("--gate_avg_weights", default="1,1,1")
     parser.add_argument("--ema_halflife", type=float, default=0.0)
@@ -164,7 +167,7 @@ def main() -> None:
                 sigma[t] = np.sqrt(var)
             risk_cache.append(sigma)
     shock_cache = None
-    if args.shock_q and args.shock_q > 0:
+    if (args.shock_q and args.shock_q > 0) or (args.topn_dyn_q_hi and args.topn_dyn_q_hi > 0):
         shock_cache = []
         for series in series_list:
             y_hist = series.y.astype(np.float64)
@@ -247,6 +250,8 @@ def main() -> None:
     shock_hist = []
     shock_scale_sum = 0.0
     shock_scale_count = 0
+    topn_cap_used = []
+    topn_riskoff = False
     pca_exposure_abs = []
     for t in np.unique(time_key):
         idx = np.where((time_key == t) & valid)[0]
@@ -289,7 +294,7 @@ def main() -> None:
             disp_hist.append(disp)
         # tail-shock scaling (uses last observed return)
         m_shock = 1.0
-        if shock_cache is not None and args.shock_q and args.shock_q > 0:
+        if shock_cache is not None and ((args.shock_q and args.shock_q > 0) or (args.topn_dyn_q_hi and args.topn_dyn_q_hi > 0)):
             shock_vals = []
             for a, t0 in zip(assets, origin_t[idx]):
                 if a < len(shock_cache):
@@ -505,10 +510,29 @@ def main() -> None:
                 w_full[assets] = 0.0
             elif gross > 1e-12:
                 w_full[assets] = w_full[assets] * (target_gross / gross)
+        cap_used = args.topn_cap
+        if (
+            args.topn_cap
+            and args.topn_cap > 0
+            and args.topn_cap_low
+            and args.topn_cap_low > 0
+            and args.topn_dyn_q_hi
+            and args.topn_dyn_q_hi > 0
+            and shock_hist
+        ):
+            hist_s = shock_hist[-args.shock_hist_window :] if args.shock_hist_window > 0 else shock_hist
+            if hist_s:
+                q_hi = float(np.quantile(hist_s, args.topn_dyn_q_hi))
+                q_lo = float(np.quantile(hist_s, args.topn_dyn_q_lo)) if args.topn_dyn_q_lo > 0 else q_hi
+                if (not topn_riskoff) and shock_t >= q_hi:
+                    topn_riskoff = True
+                elif topn_riskoff and shock_t <= q_lo:
+                    topn_riskoff = False
+            cap_used = args.topn_cap_low if topn_riskoff else args.topn_cap
         if args.topn_cap and args.topn_cap > 0:
             w_full[assets] = _apply_topn_cap(
                 w_full[assets],
-                args.topn_cap,
+                cap_used,
                 args.topn_n,
                 args.gross_target * gate_scale * m_shock,
             )
@@ -522,6 +546,8 @@ def main() -> None:
             if pca_loadings is not None:
                 expo = pca_loadings.T @ w_now
                 pca_exposure_abs.append(float(np.mean(np.abs(expo))))
+            if args.topn_cap and args.topn_cap > 0:
+                topn_cap_used.append(cap_used)
         turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
         prev_w = w_full
         shock_scale_sum += m_shock
@@ -546,6 +572,12 @@ def main() -> None:
             print(
                 f"pca_exposure_abs_mean={float(np.mean(exp_arr)):.6f} "
                 f"pca_exposure_abs_p90={float(np.percentile(exp_arr, 90)):.6f}"
+            )
+        if topn_cap_used:
+            cap_arr = np.asarray(topn_cap_used, dtype=np.float64)
+            print(
+                f"topn_cap_used_mean={float(np.mean(cap_arr)):.3f} "
+                f"topn_riskoff_frac={float(np.mean(cap_arr <= args.topn_cap_low)):.3f}"
             )
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
