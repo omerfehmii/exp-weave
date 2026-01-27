@@ -84,6 +84,8 @@ def main() -> None:
     parser.add_argument("--pca_k", type=int, default=3)
     parser.add_argument("--pca_lookback", type=int, default=90)
     parser.add_argument("--pca_min_obs", type=int, default=30)
+    parser.add_argument("--topn_cap", type=float, default=0.0)
+    parser.add_argument("--topn_n", type=int, default=10)
     parser.add_argument("--gate_combine", default="mul", choices=["mul", "min", "avg"])
     parser.add_argument("--gate_avg_weights", default="1,1,1")
     parser.add_argument("--ema_halflife", type=float, default=0.0)
@@ -503,6 +505,13 @@ def main() -> None:
                 w_full[assets] = 0.0
             elif gross > 1e-12:
                 w_full[assets] = w_full[assets] * (target_gross / gross)
+        if args.topn_cap and args.topn_cap > 0:
+            w_full[assets] = _apply_topn_cap(
+                w_full[assets],
+                args.topn_cap,
+                args.topn_n,
+                args.gross_target * gate_scale * m_shock,
+            )
         w_now = w_full[assets]
         pnl_time.append(float(np.sum(w_now * ret_t)))
         if w_now.size:
@@ -761,6 +770,38 @@ def _compute_pca_loadings(
         return None
     loadings = vt[:k].T
     return loadings
+
+
+def _apply_topn_cap(
+    w: np.ndarray,
+    cap: float,
+    topn: int,
+    target_gross: float,
+) -> np.ndarray:
+    if cap <= 0 or w.size == 0:
+        return w
+    n = min(int(topn), w.size)
+    if n <= 0:
+        return w
+    absw = np.abs(w)
+    total = float(np.sum(absw))
+    if total <= 1e-12:
+        return w
+    idx = np.argpartition(absw, -n)[-n:]
+    top_sum = float(np.sum(absw[idx]))
+    if top_sum <= cap:
+        return w
+    scale_top = cap / max(top_sum, 1e-12)
+    out = w.copy()
+    out[idx] = out[idx] * scale_top
+    rest_mask = np.ones_like(w, dtype=bool)
+    rest_mask[idx] = False
+    rest_sum = float(np.sum(np.abs(out[rest_mask])))
+    if target_gross > 0 and rest_sum > 1e-12:
+        remaining = max(target_gross - cap, 0.0)
+        scale_rest = remaining / rest_sum
+        out[rest_mask] = out[rest_mask] * scale_rest
+    return out
 
 
 if __name__ == "__main__":
