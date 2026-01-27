@@ -80,6 +80,10 @@ def main() -> None:
     parser.add_argument("--shock_k", type=float, default=0.0)
     parser.add_argument("--shock_floor", type=float, default=0.0)
     parser.add_argument("--shock_metric", default="median", choices=["median", "p90", "p95"])
+    parser.add_argument("--pca_neutral", action="store_true")
+    parser.add_argument("--pca_k", type=int, default=3)
+    parser.add_argument("--pca_lookback", type=int, default=90)
+    parser.add_argument("--pca_min_obs", type=int, default=30)
     parser.add_argument("--gate_combine", default="mul", choices=["mul", "min", "avg"])
     parser.add_argument("--gate_avg_weights", default="1,1,1")
     parser.add_argument("--ema_halflife", type=float, default=0.0)
@@ -167,6 +171,16 @@ def main() -> None:
             y_hist = np.nan_to_num(y_hist, nan=0.0)
             r = np.diff(y_hist, prepend=np.nan)
             shock_cache.append(r)
+    return_cache = None
+    if args.pca_neutral:
+        return_cache = []
+        for series in series_list:
+            y_hist = series.y.astype(np.float64)
+            if y_hist.ndim > 1:
+                y_hist = y_hist[:, 0]
+            y_hist = np.nan_to_num(y_hist, nan=0.0)
+            r = np.diff(y_hist, prepend=np.nan)
+            return_cache.append(r)
     if args.value_scale == "orig":
         if use_return_target:
             y = pre.inverse_return(y)
@@ -231,6 +245,7 @@ def main() -> None:
     shock_hist = []
     shock_scale_sum = 0.0
     shock_scale_count = 0
+    pca_exposure_abs = []
     for t in np.unique(time_key):
         idx = np.where((time_key == t) & valid)[0]
         if idx.size == 0:
@@ -297,6 +312,17 @@ def main() -> None:
                     frac = (shock_t - q) / (q + 1e-12)
                     m_shock = max(args.shock_floor, 1.0 - args.shock_k * frac)
             shock_hist.append(shock_t)
+        # PCA loadings for factor neutralization
+        pca_loadings = None
+        if args.pca_neutral and return_cache is not None:
+            pca_loadings = _compute_pca_loadings(
+                assets,
+                int(t),
+                return_cache,
+                args.pca_lookback,
+                args.pca_k,
+                args.pca_min_obs,
+            )
         # disagreement gate (requires q50_std in preds)
         if mu_std is not None and (args.disagree_q_low > 0 or args.disagree_q_high > 0):
             u_t = float(np.mean(mu_std[idx]))
@@ -412,6 +438,7 @@ def main() -> None:
                 assets,
                 int(t),
                 risk_cache,
+                pca_loadings,
                 args,
             )
             w_full = prev_w.copy()
@@ -442,6 +469,8 @@ def main() -> None:
             w = w / denom
             w_full = prev_w.copy()
             w_full[assets] = w
+        if args.pca_neutral and pca_loadings is not None:
+            w_full[assets] = _neutralize_factors(w_full[assets], pca_loadings)
         if args.min_hold and args.min_hold > 0:
             for a in assets:
                 if hold[a] > 0:
@@ -481,6 +510,9 @@ def main() -> None:
             topk = 10 if w_now.size >= 10 else w_now.size
             if topk > 0:
                 top10_time.append(float(np.sum(np.sort(np.abs(w_now))[-topk:])))
+            if pca_loadings is not None:
+                expo = pca_loadings.T @ w_now
+                pca_exposure_abs.append(float(np.mean(np.abs(expo))))
         turnover_time.append(float(np.sum(np.abs(w_full - prev_w))))
         prev_w = w_full
         shock_scale_sum += m_shock
@@ -500,6 +532,12 @@ def main() -> None:
         )
         if shock_scale_count > 0:
             print(f"shock_scale_mean={shock_scale_sum / max(shock_scale_count, 1):.3f}")
+        if pca_exposure_abs:
+            exp_arr = np.asarray(pca_exposure_abs, dtype=np.float64)
+            print(
+                f"pca_exposure_abs_mean={float(np.mean(exp_arr)):.6f} "
+                f"pca_exposure_abs_p90={float(np.percentile(exp_arr, 90)):.6f}"
+            )
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
         print(f"turnover_mean={avg_turnover:.6f}")
@@ -626,6 +664,7 @@ def _optimize_weights(
     assets: np.ndarray,
     t_idx: int,
     risk_cache: list | None,
+    pca_loadings: np.ndarray | None,
     args: argparse.Namespace,
 ) -> np.ndarray:
     n = alpha.size
@@ -655,8 +694,69 @@ def _optimize_weights(
         w = w + lr * grad
         if kappa > 0:
             w = w_prev + _soft_threshold(w - w_prev, kappa * lr)
+        if pca_loadings is not None:
+            w = _neutralize_factors(w, pca_loadings)
         w = _project_weights(w, args.pos_cap, args.gross_target, args.opt_dollar_neutral)
     return w
+
+
+def _neutralize_factors(w: np.ndarray, loadings: np.ndarray) -> np.ndarray:
+    if loadings is None or loadings.size == 0:
+        return w
+    try:
+        coeff, *_ = np.linalg.lstsq(loadings, w, rcond=None)
+        return w - loadings @ coeff
+    except np.linalg.LinAlgError:
+        return w
+
+
+def _compute_pca_loadings(
+    assets: np.ndarray,
+    t_idx: int,
+    return_cache: list,
+    lookback: int,
+    k: int,
+    min_obs: int,
+) -> np.ndarray | None:
+    if k <= 0 or lookback <= 1:
+        return None
+    n = assets.size
+    if n <= k:
+        return None
+    start = max(1, t_idx - lookback + 1)
+    end = t_idx + 1
+    T = end - start
+    if T < min_obs:
+        return None
+    X = np.zeros((T, n), dtype=np.float64)
+    valid_cols = 0
+    for j, a in enumerate(assets):
+        if a >= len(return_cache):
+            continue
+        r = return_cache[a]
+        if end > r.size:
+            continue
+        col = r[start:end].astype(np.float64, copy=True)
+        mask = np.isfinite(col)
+        if np.sum(mask) < max(5, min_obs // 3):
+            continue
+        mean = np.nanmean(col)
+        std = np.nanstd(col)
+        if std <= 1e-12:
+            continue
+        col = (col - mean) / std
+        col = np.nan_to_num(col, nan=0.0)
+        X[:, j] = col
+        valid_cols += 1
+    if valid_cols <= k:
+        return None
+    X = X - np.mean(X, axis=0, keepdims=True)
+    try:
+        _, _, vt = np.linalg.svd(X, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    loadings = vt[:k].T
+    return loadings
 
 
 if __name__ == "__main__":
