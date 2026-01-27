@@ -301,8 +301,6 @@ def main() -> None:
                 f.write(f"{v:.8f}\n")
 
 
-if __name__ == "__main__":
-    main()
 def _load_score_map(path: Path) -> tuple[np.ndarray, np.ndarray]:
     data = np.loadtxt(path, delimiter=",", skiprows=1)
     if data.ndim == 1:
@@ -320,3 +318,7 @@ def _apply_score_map(scores: np.ndarray, edges: np.ndarray, values: np.ndarray) 
             idx = np.array([np.argmax(edges[:, 1])])
         out[i] = values[int(idx[0])]
     return out
+
+
+if __name__ == "__main__":
+    main()
