@@ -167,6 +167,14 @@ python scripts/mu_value_weighted_backtest.py \
 python scripts/bootstrap_ci.py --pnl_csv runs/opt_A2_dynCap_hyst_p90.csv --method block --block_len 5
 ```
 
+## Repro control checklist
+- `git rev-parse HEAD` == `b317c5a`
+- data SHA256 matches
+- preds SHA256 matches
+- output CSV filenames match
+- KPI tolerance within range (e.g., Sharpe ±0.02, dominance ±0.02)
+- if mismatch: check random seed / BLAS / solver determinism
+
 ## Notes
 - Reported Sharpe is **per-step** (per 24h bar), not annualized.
 - For annualized Sharpe (daily bars): `Sharpe_annual ≈ Sharpe_step * sqrt(252)`.

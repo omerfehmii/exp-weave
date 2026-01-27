@@ -94,6 +94,14 @@ Run 1–2 confirmation experiments only (avoid overfitting).
 
 ---
 
+## Change protocol (parameter updates)
+- Require 12-fold walk-forward + block CI; CI lower bound must stay positive
+- dominance < 0.32
+- top-5 day contribution < 0.85
+- median fold Sharpe must not decline
+
+---
+
 ## Notes / Rationale
 - Rank-only objective is required to produce CS signal; multi-task caused gradient conflict and degraded CS metrics.
 - Optimizer reduces variance and improves Sharpe; Top-10 cap reduces tail dependence and fold dominance.
