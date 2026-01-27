@@ -594,6 +594,12 @@ def main() -> None:
     cs_rank_h = int(cs_rank_cfg.get("horizon", cfg["data"]["H"]))
     cs_rank_min_diff = float(cs_rank_cfg.get("min_diff", 0.0))
     cs_rank_use_residual = bool(cs_rank_cfg.get("use_residual", True))
+    cs_rank_mode = str(cs_rank_cfg.get("mode", "always")).lower()
+    cs_rank_alternate_every = int(cs_rank_cfg.get("alternate_every", 1))
+    if cs_rank_mode not in {"always", "alternate"}:
+        raise ValueError(f"Unknown cs_rank.mode: {cs_rank_mode}")
+    if cs_rank_alternate_every < 1:
+        cs_rank_alternate_every = 1
     warned_cs_label = False
 
     grad_diag_cfg = cfg.get("training", {}).get("grad_diag", {})
@@ -692,22 +698,22 @@ def main() -> None:
             elif cs_label and not warned_cs_label:
                 print("warning: cs_label enabled but cs_batching disabled; skipping cs_label.")
                 warned_cs_label = True
-            main_loss = pinball_weight * masked_pinball_loss_torch(y_true_main, q_hat_main, quantiles, mask, quantile_weights)
+            point_loss = pinball_weight * masked_pinball_loss_torch(y_true_main, q_hat_main, quantiles, mask, quantile_weights)
             if mae_weight > 0:
                 denom = torch.clamp(mask.sum(), min=1.0)
-                main_loss = main_loss + mae_weight * (
+                point_loss = point_loss + mae_weight * (
                     torch.sum(torch.abs(y_true_main - q_hat_main[..., q50_idx]) * mask) / denom
                 )
             if width_min_weight > 0 and width_min > 0 and q10_idx is not None and q90_idx is not None:
                 width = q_hat_main[..., q90_idx] - q_hat_main[..., q10_idx]
                 width_pen = torch.relu(width_min - width) * mask
                 denom = torch.clamp(mask.sum(), min=1.0)
-                main_loss = main_loss + width_min_weight * (width_pen.sum() / denom)
+                point_loss = point_loss + width_min_weight * (width_pen.sum() / denom)
             if repulsion_weight > 0 and q10_idx is not None and q90_idx is not None:
                 width = q_hat_main[..., q90_idx] - q_hat_main[..., q10_idx]
                 repulsion = torch.exp(-width / max(repulsion_scale, 1e-6)) * mask
                 denom = torch.clamp(mask.sum(), min=1.0)
-                main_loss = main_loss + repulsion_weight * (repulsion.sum() / denom)
+                point_loss = point_loss + repulsion_weight * (repulsion.sum() / denom)
             if cumret24_weight_used > 0:
                 if "cumret24" not in extras:
                     raise RuntimeError("cumret24_weight>0 but model did not return cumret24. Enable cumret24_head.")
@@ -720,24 +726,29 @@ def main() -> None:
                 mask_h = mask[:, h_idx]
                 denom = torch.clamp(mask_h.sum(), min=1.0)
                 cumret_loss = torch.sum((pred_h - target_h) ** 2 * mask_h) / denom
-                main_loss = main_loss + cumret24_weight_used * cumret_loss
+                point_loss = point_loss + cumret24_weight_used * cumret_loss
             if gate_entropy_weight > 0 and "gate_weights" in extras:
                 w = torch.clamp(extras["gate_weights"], 1e-8, 1.0)
                 ent = -torch.sum(w * torch.log(w), dim=-1).mean()
-                main_loss = main_loss - gate_entropy_weight * ent
+                point_loss = point_loss - gate_entropy_weight * ent
             if (moe_entropy_weight > 0 or moe_balance_weight > 0) and "moe_weights" in extras:
                 w = torch.clamp(extras["moe_weights"], 1e-8, 1.0)
                 if moe_entropy_weight > 0:
                     ent = -torch.sum(w * torch.log(w), dim=-1).mean()
-                    main_loss = main_loss - moe_entropy_weight * ent
+                    point_loss = point_loss - moe_entropy_weight * ent
                 if moe_balance_weight > 0:
                     mean_w = w.mean(dim=0)
                     target = torch.full_like(mean_w, 1.0 / mean_w.shape[0])
                     balance = torch.sum((mean_w - target) ** 2)
-                    main_loss = main_loss + moe_balance_weight * balance
-            point_loss = main_loss
+                    point_loss = point_loss + moe_balance_weight * balance
             rank_loss = None
-            if cs_rank_enabled and cs_rank_weight > 0.0:
+            do_point = True
+            do_rank = True
+            if cs_rank_mode == "alternate" and cs_rank_enabled and cs_rank_weight > 0.0:
+                phase = (global_step // cs_rank_alternate_every) % 2
+                do_rank = phase == 0
+                do_point = not do_rank
+            if cs_rank_enabled and cs_rank_weight > 0.0 and (cs_rank_mode == "always" or do_rank):
                 if not cs_batch_enabled:
                     if not warned_cs_label:
                         print("warning: cs_rank enabled but cs_batching disabled; skipping cs_rank.")
@@ -768,9 +779,17 @@ def main() -> None:
                         if torch.any(keep):
                             sign = torch.sign(label_diff[keep])
                             rank_loss = F.softplus(-sign * diff[keep]).mean()
-                            main_loss = main_loss + cs_rank_weight * rank_loss
                             rank_loss_sum += float(rank_loss.item())
                             rank_batches += 1
+            main_loss = None
+            if do_point:
+                main_loss = point_loss
+            if do_rank and rank_loss is not None:
+                main_loss = (
+                    main_loss + cs_rank_weight * rank_loss if main_loss is not None else cs_rank_weight * rank_loss
+                )
+            if main_loss is None:
+                continue
             if (
                 grad_diag_enabled
                 and rank_loss is not None
