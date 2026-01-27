@@ -170,6 +170,7 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
     gate_cfg = patch_cfg.get("gate", {})
     scale_drop_cfg = patch_cfg.get("scale_drop", {})
     dir_head_cfg = cfg.get("direction_head", {})
+    rank_head_cfg = model_cfg.get("rank_head", {})
     cumret_cfg = cfg.get("cumret24_head", {})
     cumret_enabled = False
     if isinstance(cumret_cfg, dict):
@@ -217,6 +218,7 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         head_type=head_cfg.get("type", "MONO"),
         head_delta_floor=head_cfg.get("delta_floor", 0.0),
         head_lsq_s_min=head_cfg.get("lsq_s_min", 0.0),
+        head_detach=bool(model_cfg.get("head_detach", False)),
         mask_embedding=missing_cfg.get("mask_embedding", True),
         delta_t_mode=delta_t_mode,
         attn_logit_bias=missing_cfg.get("attn_logit_bias", "HARD_NEG_INF"),
@@ -227,6 +229,9 @@ def build_model(cfg: Dict) -> MultiScaleForecastModel:
         dir_head_type=dir_head_cfg.get("type", "hierarchical"),
         dir_head_detach=dir_head_cfg.get("detach", False),
         dir_head_dropout=dir_head_cfg.get("dropout", 0.0),
+        rank_head_enabled=bool(rank_head_cfg.get("enabled", model_cfg.get("rank_head_enabled", False))),
+        rank_head_detach=bool(rank_head_cfg.get("detach", model_cfg.get("rank_head_detach", False))),
+        rank_head_dropout=float(rank_head_cfg.get("dropout", model_cfg.get("rank_head_dropout", 0.0))),
         cumret24_head=cumret_enabled,
         moe_enabled=bool(moe_cfg.get("enabled", False)),
         moe_gate_hidden=int(moe_cfg.get("gate_hidden", model_cfg.get("d_model", 256))),
