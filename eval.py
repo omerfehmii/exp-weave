@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from backtest.harness import generate_panel_origins, make_time_splits, select_indices_by_time
+from backtest.harness import TimeSplit, generate_panel_origins, make_time_splits, select_indices_by_time
 from backtest.metrics import horizon_collapse, quantile_crossing_rate
 from backtest.diagnostics import (
     attention_similarity,
@@ -576,7 +576,24 @@ def main() -> None:
 
     series_list = build_series_list(cfg["data"]["path"], observed_only=cfg["data"].get("observed_only", False))
     lengths = [len(s.y) for s in series_list]
-    split = make_time_splits(min(lengths), cfg["data"].get("train_frac", 0.7), cfg["data"].get("val_frac", 0.15))
+    split_train_end = cfg["data"].get("split_train_end", None)
+    split_val_end = cfg["data"].get("split_val_end", None)
+    split_test_end = cfg["data"].get("split_test_end", None)
+    if split_train_end is not None or split_val_end is not None or split_test_end is not None:
+        if split_train_end is None or split_val_end is None:
+            raise ValueError("split_train_end and split_val_end must both be set when using split overrides.")
+        T_min = min(lengths)
+        train_end = int(split_train_end)
+        val_end = int(split_val_end)
+        test_end = int(split_test_end) if split_test_end is not None else T_min
+        if not (0 <= train_end <= val_end <= test_end <= T_min):
+            raise ValueError(
+                f"Invalid split overrides: train_end={train_end} val_end={val_end} "
+                f"test_end={test_end} T_min={T_min}"
+            )
+        split = TimeSplit(train_end=train_end, val_end=val_end, test_end=test_end)
+    else:
+        split = make_time_splits(min(lengths), cfg["data"].get("train_frac", 0.7), cfg["data"].get("val_frac", 0.15))
     split_purge = int(cfg["data"].get("split_purge", 0)) if args.split_purge is None else int(args.split_purge)
     split_embargo = int(cfg["data"].get("split_embargo", 0)) if args.split_embargo is None else int(args.split_embargo)
     dir_cfg = cfg.get("data", {}).get("direction_features", {})
