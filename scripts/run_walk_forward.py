@@ -181,6 +181,17 @@ def _summarize_metrics(path: Path) -> Dict[str, float]:
 
     df = pd.read_csv(path)
     pnl = df["pnl"].to_numpy()
+    if pnl.size == 0:
+        return {
+            "n": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "sharpe": float("nan"),
+            "sharpe_gross": float("nan"),
+            "sharpe_vol": float("nan"),
+            "top5_sum": float("nan"),
+            "top5_over_total": float("nan"),
+        }
     gross = df["gross"].to_numpy() if "gross" in df.columns else None
     vol = df["vol_mkt"].to_numpy() if "vol_mkt" in df.columns else None
     mean = float(np.mean(pnl))
