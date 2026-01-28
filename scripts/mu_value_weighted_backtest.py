@@ -110,6 +110,7 @@ def main() -> None:
     parser.add_argument("--walk_folds", type=int, default=0)
     parser.add_argument("--out_csv", default=None)
     parser.add_argument("--out_metrics", default=None)
+    parser.add_argument("--oos_last_steps", type=int, default=0)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -199,6 +200,15 @@ def main() -> None:
     mu = q50[:, h_idx]
     mu_std = q50_std[:, h_idx] if q50_std is not None else None
     ret = y[:, h_idx]
+    if args.oos_last_steps and args.oos_last_steps > 0:
+        valid_times = np.unique(origin_t[valid])
+        if valid_times.size == 0:
+            print("oos_last_steps: no valid times available")
+        else:
+            n = min(int(args.oos_last_steps), valid_times.size)
+            sel_times = valid_times[-n:]
+            valid = valid & np.isin(origin_t, sel_times)
+            print(f"oos_last_steps={n} time_min={int(sel_times[0])} time_max={int(sel_times[-1])}")
 
     if origin_t is None or series_idx is None:
         raise ValueError("preds must include origin_t and series_idx for portfolio backtest.")
@@ -247,6 +257,8 @@ def main() -> None:
     hhi_time = []
     top10_time = []
     turnover_time = []
+    gross_time = []
+    vol_mkt_time = []
     shock_hist = []
     shock_scale_sum = 0.0
     shock_scale_count = 0
@@ -259,6 +271,7 @@ def main() -> None:
             continue
         mu_t = mu[idx].astype(np.float64, copy=True)
         ret_t = ret[idx].astype(np.float64, copy=True)
+        ret_t_raw = ret_t.copy()
         if args.use_cs:
             mu_t = mu_t - np.mean(mu_t)
         if args.ret_cs:
@@ -538,6 +551,9 @@ def main() -> None:
             )
         w_now = w_full[assets]
         pnl_time.append(float(np.sum(w_now * ret_t)))
+        gross_time.append(float(np.sum(np.abs(w_now))))
+        if ret_t_raw.size:
+            vol_mkt_time.append(float(np.median(np.abs(ret_t_raw))))
         if w_now.size:
             hhi_time.append(float(np.sum(w_now * w_now)))
             topk = 10 if w_now.size >= 10 else w_now.size
@@ -559,6 +575,18 @@ def main() -> None:
         f"cs={args.use_cs} ret_cs={args.ret_cs} topk={args.topk} n_times={pnl_time.size}"
     )
     _summarize("portfolio", pnl_time)
+    if gross_time:
+        gross_arr = np.asarray(gross_time, dtype=np.float64)
+        pnl_arr = np.asarray(pnl_time, dtype=np.float64)
+        mask_g = (gross_arr > 1e-12) & np.isfinite(gross_arr) & np.isfinite(pnl_arr)
+        if np.any(mask_g):
+            _summarize("gross_norm", pnl_arr[mask_g] / gross_arr[mask_g])
+    if vol_mkt_time:
+        vol_arr = np.asarray(vol_mkt_time, dtype=np.float64)
+        pnl_arr = np.asarray(pnl_time, dtype=np.float64)
+        mask_v = (vol_arr > 1e-12) & np.isfinite(vol_arr) & np.isfinite(pnl_arr)
+        if np.any(mask_v):
+            _summarize("vol_norm", pnl_arr[mask_v] / vol_arr[mask_v])
     if pnl_time.size > 0:
         avg_scale = gate_scale_sum / max(gate_scale_count, 1)
         print(
@@ -634,11 +662,13 @@ def main() -> None:
         out_path = Path(args.out_metrics)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w", encoding="utf-8") as f:
-            f.write("pnl,hhi,top10\n")
+            f.write("pnl,hhi,top10,gross,vol_mkt\n")
             for i, v in enumerate(pnl_time):
                 h = hhi_time[i] if i < len(hhi_time) else float("nan")
                 t = top10_time[i] if i < len(top10_time) else float("nan")
-                f.write(f"{v:.8f},{h:.8f},{t:.8f}\n")
+                g = gross_time[i] if i < len(gross_time) else float("nan")
+                vm = vol_mkt_time[i] if i < len(vol_mkt_time) else float("nan")
+                f.write(f"{v:.8f},{h:.8f},{t:.8f},{g:.8f},{vm:.8f}\n")
 
 
 def _load_score_map(path: Path) -> tuple[np.ndarray, np.ndarray]:
