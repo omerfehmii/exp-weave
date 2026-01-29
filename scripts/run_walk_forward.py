@@ -7,7 +7,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import yaml
@@ -251,6 +251,34 @@ def _summarize_metrics(path: Path) -> Dict[str, float]:
     }
 
 
+def _ic_count_stats(preds_path: Path, horizon: int) -> Tuple[Optional[float], Optional[float], Optional[float], np.ndarray]:
+    with np.load(preds_path) as d:
+        if "mask" not in d or "origin_t" not in d:
+            return None, None, None, np.array([], dtype=np.int64)
+        mask = d["mask"]
+        origin_t = d["origin_t"]
+        if mask.ndim != 2 or horizon < 1 or horizon > mask.shape[1]:
+            return None, None, None, np.array([], dtype=np.int64)
+        valid = mask[:, horizon - 1] > 0
+        times = origin_t[valid]
+        if times.size == 0:
+            return None, None, None, np.array([], dtype=np.int64)
+        _, counts = np.unique(times, return_counts=True)
+        if counts.size == 0:
+            return None, None, None, np.array([], dtype=np.int64)
+        mean = float(np.mean(counts))
+        p10 = float(np.percentile(counts, 10))
+        ge20 = float(np.mean(counts >= 20))
+        return mean, p10, ge20, counts
+
+
+def _ignore_ratio(preds_path: Path) -> Optional[float]:
+    with np.load(preds_path) as d:
+        if "ignore" in d:
+            return float(np.mean(d["ignore"]))
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_config", required=True)
@@ -293,6 +321,8 @@ def main() -> None:
 
     summary_rows: List[Dict] = []
     combined_metrics_paths: List[Path] = []
+    ic_counts_all: List[np.ndarray] = []
+    ignore_vals: List[float] = []
 
     for fold in folds:
         fold_dir = out_dir / f"fold_{fold.fold}"
@@ -376,6 +406,19 @@ def main() -> None:
             subprocess.run(cmd, check=True)
 
         fold_summary = _summarize_metrics(out_metrics)
+        ic_mean, ic_p10, ic_ge20, counts = _ic_count_stats(ens_path, horizon)
+        if counts.size:
+            ic_counts_all.append(counts)
+        fold_summary["ic_count_mean"] = ic_mean if ic_mean is not None else float("nan")
+        fold_summary["ic_count_p10"] = ic_p10 if ic_p10 is not None else float("nan")
+        fold_summary["ic_count_ge20_ratio"] = ic_ge20 if ic_ge20 is not None else float("nan")
+        ignore_ratio = _ignore_ratio(ens_path)
+        if ignore_ratio is not None:
+            ignore_vals.append(ignore_ratio)
+            fold_summary["ignore_ratio"] = ignore_ratio
+        else:
+            fold_summary["ignore_ratio"] = float("nan")
+        fold_summary["cost_included"] = False
         fold_summary["fold"] = fold.fold
         summary_rows.append(fold_summary)
         combined_metrics_paths.append(out_metrics)
@@ -391,6 +434,12 @@ def main() -> None:
     all_df = pd.concat(dfs, ignore_index=True)
     all_df.to_csv(out_dir / "metrics_all.csv", index=False)
     comb = _summarize_metrics(out_dir / "metrics_all.csv")
+    ic_all = np.concatenate(ic_counts_all) if ic_counts_all else np.array([], dtype=np.int64)
+    comb["ic_count_mean"] = float(np.mean(ic_all)) if ic_all.size else float("nan")
+    comb["ic_count_p10"] = float(np.percentile(ic_all, 10)) if ic_all.size else float("nan")
+    comb["ic_count_ge20_ratio"] = float(np.mean(ic_all >= 20)) if ic_all.size else float("nan")
+    comb["ignore_ratio"] = float(np.mean(ignore_vals)) if ignore_vals else float("nan")
+    comb["cost_included"] = False
     comb_path = out_dir / "summary_all.json"
     with comb_path.open("w", encoding="utf-8") as f:
         json.dump(comb, f, indent=2)
