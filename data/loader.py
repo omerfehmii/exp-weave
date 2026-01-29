@@ -153,6 +153,33 @@ def load_panel_npz(path: str) -> List[SeriesData]:
     return series_list
 
 
+def filter_series_by_active_ratio(
+    series_list: List[SeriesData],
+    min_ratio: Optional[float] = None,
+    min_points: Optional[int] = None,
+) -> List[SeriesData]:
+    if not min_ratio and not min_points:
+        return series_list
+    filtered: List[SeriesData] = []
+    for series in series_list:
+        y = series.y
+        y2 = y[:, None] if y.ndim == 1 else y
+        mask = series.mask
+        if mask is None:
+            mask = make_observation_mask(y2)
+        if mask.ndim == 1:
+            mask = mask[:, None]
+        active = mask[:, 0] > 0
+        active_count = int(np.sum(active))
+        active_ratio = active_count / float(len(active)) if len(active) else 0.0
+        if min_ratio and active_ratio < float(min_ratio):
+            continue
+        if min_points and active_count < int(min_points):
+            continue
+        filtered.append(series)
+    return filtered
+
+
 def compress_series_observed(series_list: List[SeriesData]) -> List[SeriesData]:
     compressed: List[SeriesData] = []
     for series in series_list:

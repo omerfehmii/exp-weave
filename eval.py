@@ -19,7 +19,7 @@ from backtest.diagnostics import (
     width_stats_per_horizon,
 )
 from calibration.cqr import CQRCalibrator
-from data.loader import SeriesData, WindowedDataset, load_panel_npz, compress_series_observed
+from data.loader import SeriesData, WindowedDataset, load_panel_npz, compress_series_observed, filter_series_by_active_ratio
 from data.features import append_direction_features
 from data.missingness import MissingnessConfig, MissingnessDataset
 from data.preprocess import FoldFitPreprocessor
@@ -105,10 +105,19 @@ def pinball_per_horizon(y_true: np.ndarray, q_pred: np.ndarray, tau: float, mask
     return np.sum(loss * mask, axis=0) / np.maximum(denom, 1.0)
 
 
-def build_series_list(path: str, observed_only: bool = False) -> List[SeriesData]:
+def build_series_list(
+    path: str,
+    observed_only: bool = False,
+    min_active_ratio: float = 0.0,
+    min_active_points: int = 0,
+) -> List[SeriesData]:
     series_list = load_panel_npz(path)
     if observed_only:
         series_list = compress_series_observed(series_list)
+    if min_active_ratio or min_active_points:
+        series_list = filter_series_by_active_ratio(series_list, min_active_ratio, min_active_points)
+        if not series_list:
+            raise ValueError("Universe filter removed all series. Check universe_min_active_ratio/points.")
     for series in series_list:
         series.ensure_features()
     return series_list
@@ -574,7 +583,12 @@ def main() -> None:
     regime_window = int(regime_cfg.get("window", cfg["data"]["L"]))
     regime_eps = float(regime_cfg.get("eps", 1e-6))
 
-    series_list = build_series_list(cfg["data"]["path"], observed_only=cfg["data"].get("observed_only", False))
+    series_list = build_series_list(
+        cfg["data"]["path"],
+        observed_only=cfg["data"].get("observed_only", False),
+        min_active_ratio=float(cfg["data"].get("universe_min_active_ratio", 0.0)),
+        min_active_points=int(cfg["data"].get("universe_min_active_points", 0)),
+    )
     lengths = [len(s.y) for s in series_list]
     split_train_end = cfg["data"].get("split_train_end", None)
     split_val_end = cfg["data"].get("split_val_end", None)

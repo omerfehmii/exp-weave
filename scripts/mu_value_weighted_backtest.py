@@ -11,7 +11,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from backtest.harness import make_time_splits
-from data.loader import compress_series_observed, load_panel_npz
+from data.loader import compress_series_observed, load_panel_npz, filter_series_by_active_ratio
 from eval import apply_scaling
 from utils import load_config
 
@@ -20,6 +20,10 @@ def _load_series(cfg: Dict) -> list:
     series_list = load_panel_npz(cfg["data"]["path"])
     if cfg.get("data", {}).get("observed_only", False):
         series_list = compress_series_observed(series_list)
+    min_ratio = float(cfg.get("data", {}).get("universe_min_active_ratio", 0.0))
+    min_points = int(cfg.get("data", {}).get("universe_min_active_points", 0))
+    if min_ratio or min_points:
+        series_list = filter_series_by_active_ratio(series_list, min_ratio, min_points)
     for s in series_list:
         s.ensure_features()
     return series_list

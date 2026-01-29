@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data.loader import load_panel_npz, compress_series_observed
+from data.loader import load_panel_npz, compress_series_observed, filter_series_by_active_ratio
 
 
 @dataclass
@@ -47,6 +47,10 @@ def _load_series(cfg: Dict) -> List:
     series = load_panel_npz(str(cfg["data"]["path"]))
     if cfg.get("data", {}).get("observed_only", False):
         series = compress_series_observed(series)
+    min_ratio = float(cfg.get("data", {}).get("universe_min_active_ratio", 0.0))
+    min_points = int(cfg.get("data", {}).get("universe_min_active_points", 0))
+    if min_ratio or min_points:
+        series = filter_series_by_active_ratio(series, min_ratio, min_points)
     return series
 
 
@@ -474,7 +478,14 @@ def main() -> None:
     print("policy_params:", json.dumps(policy_params, sort_keys=True))
     overall_cov = _overall_active_coverage(cfg, horizon)
     print("overall_active_coverage:", json.dumps(overall_cov, sort_keys=True))
+    raw_series = load_panel_npz(str(cfg["data"]["path"]))
     series_list_for_stats = _load_series(cfg)
+    universe_filter = {
+        "n_series_raw": int(len(raw_series)),
+        "n_series_filtered": int(len(series_list_for_stats)),
+        "min_active_ratio": float(cfg["data"].get("universe_min_active_ratio", 0.0)),
+        "min_active_points": int(cfg["data"].get("universe_min_active_points", 0)),
+    }
     obs_interval = _infer_obs_interval(series_list_for_stats)
     base_hours = _infer_freq_hours(cfg["data"].get("freq"))
     observed_only = bool(cfg["data"].get("observed_only", False))
@@ -491,6 +502,7 @@ def main() -> None:
     if obs_interval:
         time_units.update(obs_interval)
     print("time_units:", json.dumps(time_units, sort_keys=True))
+    print("universe_filter:", json.dumps(universe_filter, sort_keys=True))
     if base_hours and step > 1 and horizon > 1:
         print("warning: step>1 and H>1; verify horizon units vs sampling interval")
     if observed_only:
@@ -692,6 +704,7 @@ def main() -> None:
         "time_units": time_units,
         "observed_only": observed_only,
         "time_axis_mode": "compressed" if observed_only else "original",
+        "universe_filter": universe_filter,
         "protocol": {
             "purge_len": int(cfg["data"].get("split_purge", 0)),
             "embargo_len": int(cfg["data"].get("split_embargo", 0)),
