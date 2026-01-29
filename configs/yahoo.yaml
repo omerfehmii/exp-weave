@@ -1,0 +1,58 @@
+data:
+  path: data/yahoo_panel.npz
+  freq: hourly
+  L: 240
+  H: 24
+  quantiles: [0.1, 0.5, 0.9]
+  target_dim: 1
+  past_feat_dim: 6
+  future_feat_dim: 6
+  train_frac: 0.7
+  val_frac: 0.15
+  step: 24
+  scale_x: true
+
+model:
+  d_model: 128
+  n_layers: 2
+  n_heads: 4
+  mlp_hidden: 256
+  dropout: 0.1
+
+patching:
+  scales:
+    - {P: 6, S: 3, name: fine}
+    - {P: 24, S: 12, name: coarse}
+  fusion: TWO_ENCODERS_GATED
+  gate:
+    entropy_floor: 0.2
+    temperature: 1.0
+
+decoder:
+  mode: CA_ONLY
+  cats_masking:
+    enabled: true
+    p_min: 0.1
+    p_max: 0.7
+    scaling: NONE
+
+calibration:
+  cqr:
+    enabled: false
+    rolling_window_days: 30
+    scope: PER_HORIZON
+
+training:
+  seed: 7
+  batch_size: 64
+  epochs: 2
+  device: cpu
+  grad_clip: 1.0
+  output_path: artifacts/yahoo_model.pt
+  loss:
+    pinball_weight: 1.0
+    mae_weight: 0.0
+  optimizer:
+    name: adamw
+    lr: 1.0e-3
+    weight_decay: 0.01

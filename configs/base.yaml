@@ -1,0 +1,108 @@
+data:
+  path: data/panel.npz
+  freq: hourly
+  L: 240
+  H: 24
+  quantiles: [0.1, 0.5, 0.9]
+  target_dim: 1
+  past_feat_dim: 6
+  future_feat_dim: 6
+  train_frac: 0.7
+  val_frac: 0.15
+  step: 24
+  scale_x: true
+  scale_y: true
+  target_mode: level
+  target_log_eps: 1.0e-6
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  mlp_hidden: 1024
+  dropout: 0.1
+  cumret24_head: false
+
+patching:
+  scales:
+    - {P: 6, S: 3, name: fine}
+    - {P: 24, S: 12, name: coarse}
+  fusion: TWO_ENCODERS_GATED
+  gate:
+    entropy_floor: 0.2
+    temperature: 1.0
+    logit_clip: null
+    fixed_weight: null
+    use_regime_features: false
+    regime_window: 240
+    regime_eps: 1.0e-6
+    disable_coarse: false
+    disable_fine: false
+  scale_drop:
+    drop_coarse_p: 0.0
+    drop_fine_p: 0.0
+
+moe:
+  enabled: false
+  gate_hidden: 256
+  gate_temperature: 1.0
+  gate_logit_clip: null
+  use_regime_features: false
+  regime_window: 240
+  regime_eps: 1.0e-6
+  expert_drop_trend: 0.0
+  expert_drop_mr: 0.0
+
+decoder:
+  mode: CA_ONLY
+  cats_masking:
+    enabled: true
+    p_min: 0.1
+    p_max: 0.7
+    scaling: NONE
+
+calibration:
+  cqr:
+    enabled: false
+    rolling_window_days: 30
+    scope: PER_HORIZON
+
+evaluation:
+  regime:
+    enabled: true
+    window: 240
+    trend_q: 0.7
+    mr_q: 0.3
+    vol_q: 0.7
+    chop_q: 0.7
+    jump_q: 0.9
+    no_trade:
+      width_quantile: 0.8
+      min_count: 50
+
+training:
+  seed: 7
+  batch_size: 32
+  epochs: 10
+  device: cpu
+  grad_clip: 1.0
+  output_path: artifacts/model.pt
+  resume_from: null
+  resume_optimizer: true
+  resume_reset_epoch: false
+  resume_reset_lr: true
+  save_every_epoch: false
+  coverage_guard_min: null
+  coverage_guard_max: null
+  coverage_guard_fail: false
+  loss:
+    pinball_weight: 1.0
+    mae_weight: 0.0
+    cumret24_weight: 0.0
+    cumret24_warmup_epochs: 0
+    moe_entropy_weight: 0.0
+    moe_balance_weight: 0.0
+  optimizer:
+    name: adamw
+    lr: 1.0e-3
+    weight_decay: 0.01

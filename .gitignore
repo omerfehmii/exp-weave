@@ -1,0 +1,11 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+artifacts/
+runs/
+*.pt
+*.npz
+*.log
+*.err
+configs/ablations/sweep/*
