@@ -1,0 +1,104 @@
+data:
+  path: data/yahoo_panel_big.npz
+  freq: hourly
+  L: 240
+  H: 24
+  quantiles:
+  - 0.1
+  - 0.5
+  - 0.9
+  target_dim: 1
+  past_feat_dim: 6
+  future_feat_dim: 6
+  train_frac: 0.6
+  val_frac: 0.1
+  step: 24
+  scale_x: true
+  scale_y: true
+  target_mode: return
+  target_log_eps: 1.0e-06
+  min_past_obs: 24
+  min_future_obs: 24
+  observed_only: true
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  mlp_hidden: 1024
+  dropout: 0.1
+patching:
+  scales:
+  - P: 6
+    S: 3
+    name: fine
+  - P: 24
+    S: 12
+    name: coarse
+  fusion: TWO_ENCODERS_GATED
+  dual_sum_weight: equal
+  gate:
+    entropy_floor: 0.2
+    temperature: 1.0
+decoder:
+  mode: CA_ONLY
+  cats_masking:
+    enabled: true
+    p_min: 0.1
+    p_max: 0.7
+    scaling: NONE
+  dual_path:
+    enabled: false
+    uncertainty_cats: false
+head:
+  type: MONO
+  delta_floor: 0.0
+  lsq_s_min: 0.0
+missingness:
+  mask_embedding: true
+  dt_embedding: MLP_LOG1P
+  attn_logit_bias: HARD_NEG_INF
+training:
+  seed: 77
+  batch_size: 64
+  epochs: 10
+  device: cuda
+  grad_clip: 1.0
+  output_path: artifacts/cs_l1_w10_oos_s77.pt
+  log_path: runs/logs/cs_l1_w10_oos_s77.jsonl
+  log_every: 200
+  cs_batching:
+    enabled: true
+    val_enabled: true
+    min_assets: 5
+    max_assets: 0
+    shuffle: true
+  cs_rank:
+    enabled: true
+    weight: 1.0
+    horizon: 24
+    use_residual: true
+    sample_pairs: 0
+    sample_strategy: all
+    strat_bins: 3
+    min_diff: 0.0
+    mode: always
+    alternate_every: 1
+  loss:
+    pinball_weight: 0.0
+    mae_weight: 0.0
+    quantile_weights:
+    - 1.0
+    - 1.0
+    - 1.0
+    width_min: 0.0
+    width_min_weight: 0.0
+    repulsion_weight: 0.0
+    repulsion_scale: 1.0
+    cumret24_weight: 0.0
+    cumret24_warmup_epochs: 0
+  optimizer:
+    name: adamw
+    lr: 0.001
+    weight_decay: 0.01
+  early_stopping:
+    enabled: false
