@@ -470,6 +470,7 @@ def main() -> None:
     series_list_for_stats = load_panel_npz(str(cfg["data"]["path"]))
     obs_interval = _infer_obs_interval(series_list_for_stats)
     base_hours = _infer_freq_hours(cfg["data"].get("freq"))
+    observed_only = bool(cfg["data"].get("observed_only", False))
     time_units = {
         "data_freq": cfg["data"].get("freq"),
         "base_bar_hours": base_hours,
@@ -477,12 +478,16 @@ def main() -> None:
         "step_bars": step,
         "effective_horizon_hours": float(horizon * base_hours) if base_hours else None,
         "origin_stride_hours": float(step * base_hours) if base_hours else None,
+        "observed_only": observed_only,
+        "time_axis_mode": "compressed" if observed_only else "original",
     }
     if obs_interval:
         time_units.update(obs_interval)
     print("time_units:", json.dumps(time_units, sort_keys=True))
     if base_hours and step > 1 and horizon > 1:
         print("warning: step>1 and H>1; verify horizon units vs sampling interval")
+    if observed_only:
+        print("warning: observed_only=true compresses time axis; H counts observations, not hours")
 
     folds = _build_folds(n_origins, origin_min, step, args.fold_size, args.n_folds, args.val_size)
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
@@ -678,6 +683,8 @@ def main() -> None:
         "policy_params": policy_params,
         "overall_active_coverage": overall_cov,
         "time_units": time_units,
+        "observed_only": observed_only,
+        "time_axis_mode": "compressed" if observed_only else "original",
         "protocol": {
             "purge_len": int(cfg["data"].get("split_purge", 0)),
             "embargo_len": int(cfg["data"].get("split_embargo", 0)),
