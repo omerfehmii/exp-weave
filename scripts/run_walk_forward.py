@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data.loader import load_panel_npz
+from data.loader import load_panel_npz, compress_series_observed
 
 
 @dataclass
@@ -43,12 +43,19 @@ def _save_cfg(cfg: Dict, path: Path) -> None:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
 
+def _load_series(cfg: Dict) -> List:
+    series = load_panel_npz(str(cfg["data"]["path"]))
+    if cfg.get("data", {}).get("observed_only", False):
+        series = compress_series_observed(series)
+    return series
+
+
 def _compute_origin_info(cfg: Dict) -> Tuple[int, int, int, int]:
     data = cfg["data"]
     L = int(data["L"])
     H = int(data["H"])
     step = int(data.get("step", H))
-    series = load_panel_npz(str(data["path"]))
+    series = _load_series(cfg)
     lengths = [len(s.y) for s in series]
     T = min(lengths)
     origin_min = L - 1
@@ -64,7 +71,7 @@ def _compute_valid_origin_max(cfg: Dict, horizon: int) -> int:
     L = int(data["L"])
     H = int(data["H"])
     step = int(data.get("step", H))
-    series = load_panel_npz(str(data["path"]))
+    series = _load_series(cfg)
     T = min(len(s.y) for s in series)
     # Generate all origin candidates.
     origins = []
@@ -254,7 +261,7 @@ def _overall_active_coverage(cfg: Dict, horizon: int) -> Dict[str, float]:
     L = int(data["L"])
     H = int(data["H"])
     step = int(data.get("step", H))
-    series = load_panel_npz(str(data["path"]))
+    series = _load_series(cfg)
     T = min(len(s.y) for s in series)
     origin_min = L - 1
     origin_max = T - H - 1
@@ -467,7 +474,7 @@ def main() -> None:
     print("policy_params:", json.dumps(policy_params, sort_keys=True))
     overall_cov = _overall_active_coverage(cfg, horizon)
     print("overall_active_coverage:", json.dumps(overall_cov, sort_keys=True))
-    series_list_for_stats = load_panel_npz(str(cfg["data"]["path"]))
+    series_list_for_stats = _load_series(cfg)
     obs_interval = _infer_obs_interval(series_list_for_stats)
     base_hours = _infer_freq_hours(cfg["data"].get("freq"))
     observed_only = bool(cfg["data"].get("observed_only", False))
