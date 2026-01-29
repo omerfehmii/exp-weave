@@ -263,6 +263,7 @@ def main() -> None:
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--policy_preset", default="dynCap2")
     parser.add_argument("--min_future_obs", type=int, default=None, help="Override data.min_future_obs for folds.")
+    parser.add_argument("--min_past_obs", type=int, default=None, help="Override data.min_past_obs for folds.")
     args = parser.parse_args()
 
     base_cfg_path = Path(args.base_config)
@@ -329,6 +330,8 @@ def main() -> None:
             cfg_fold["data"]["min_future_obs"] = horizon
             if args.min_future_obs is not None:
                 cfg_fold["data"]["min_future_obs"] = int(args.min_future_obs)
+            if args.min_past_obs is not None:
+                cfg_fold["data"]["min_past_obs"] = int(args.min_past_obs)
             cfg_fold.setdefault("training", {})
             cfg_fold["training"]["seed"] = seed
             ckpt = fold_dir / "checkpoints" / f"cs_l1_w10_s{seed}.pt"
