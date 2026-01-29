@@ -277,6 +277,34 @@ def _overall_active_coverage(cfg: Dict, horizon: int) -> Dict[str, float]:
     }
 
 
+def _infer_obs_interval(series_list: List) -> Dict[str, float]:
+    for s in series_list:
+        if s.timestamps is None or len(s.timestamps) < 2:
+            continue
+        dt = np.diff(s.timestamps).astype("timedelta64[h]").astype(np.float32)
+        dt = dt[np.isfinite(dt) & (dt > 0)]
+        if dt.size:
+            return {
+                "obs_interval_hours_median": float(np.median(dt)),
+                "obs_interval_hours_p10": float(np.percentile(dt, 10)),
+                "obs_interval_hours_p90": float(np.percentile(dt, 90)),
+            }
+    return {}
+
+
+def _infer_freq_hours(freq: Optional[str]) -> Optional[float]:
+    if not freq:
+        return None
+    f = freq.lower()
+    if "hour" in f:
+        return 1.0
+    if "day" in f:
+        return 24.0
+    if "min" in f:
+        return 1.0 / 60.0
+    return None
+
+
 def _summarize_metrics(path: Path) -> Dict[str, float]:
     import pandas as pd
 
@@ -439,6 +467,22 @@ def main() -> None:
     print("policy_params:", json.dumps(policy_params, sort_keys=True))
     overall_cov = _overall_active_coverage(cfg, horizon)
     print("overall_active_coverage:", json.dumps(overall_cov, sort_keys=True))
+    series_list_for_stats = load_panel_npz(str(cfg["data"]["path"]))
+    obs_interval = _infer_obs_interval(series_list_for_stats)
+    base_hours = _infer_freq_hours(cfg["data"].get("freq"))
+    time_units = {
+        "data_freq": cfg["data"].get("freq"),
+        "base_bar_hours": base_hours,
+        "H_bars": horizon,
+        "step_bars": step,
+        "effective_horizon_hours": float(horizon * base_hours) if base_hours else None,
+        "origin_stride_hours": float(step * base_hours) if base_hours else None,
+    }
+    if obs_interval:
+        time_units.update(obs_interval)
+    print("time_units:", json.dumps(time_units, sort_keys=True))
+    if base_hours and step > 1 and horizon > 1:
+        print("warning: step>1 and H>1; verify horizon units vs sampling interval")
 
     folds = _build_folds(n_origins, origin_min, step, args.fold_size, args.n_folds, args.val_size)
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
@@ -633,6 +677,7 @@ def main() -> None:
         "coverage_warn_folds": int(np.sum([1 for row in summary_rows if row.get("coverage_warn")])),
         "policy_params": policy_params,
         "overall_active_coverage": overall_cov,
+        "time_units": time_units,
         "protocol": {
             "purge_len": int(cfg["data"].get("split_purge", 0)),
             "embargo_len": int(cfg["data"].get("split_embargo", 0)),
