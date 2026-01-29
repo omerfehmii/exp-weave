@@ -121,7 +121,49 @@ def _build_folds(n_origins: int, origin_min: int, step: int, fold_size: int, n_f
     return folds
 
 
+def _policy_params_dyn_cap_2() -> Dict[str, str]:
+    return {
+        "h": "24",
+        "disp_metric": "std",
+        "disp_hist_window": "200",
+        "disp_scale_q_low": "0.15",
+        "disp_scale_q_high": "0.40",
+        "disp_scale_floor": "0.25",
+        "disp_scale_power": "2.0",
+        "disagree_q_low": "0.4",
+        "disagree_q_high": "0.7",
+        "disagree_hist_window": "200",
+        "disagree_scale": "0.3",
+        "consistency_min": "0.05",
+        "consistency_scale": "0.6",
+        "gate_combine": "avg",
+        "gate_avg_weights": "0.45,0.35,0.20",
+        "ema_halflife_min": "2",
+        "ema_halflife_max": "8",
+        "ema_disp_lo": "0.02",
+        "ema_disp_hi": "0.10",
+        "min_hold": "2",
+        "turnover_budget": "0.15",
+        "pos_cap": "0.04",
+        "gross_target": "1.0",
+        "optimize": "true",
+        "opt_lambda": "1.0",
+        "opt_kappa": "0.0",
+        "opt_steps": "20",
+        "opt_risk_window": "240",
+        "opt_dollar_neutral": "true",
+        "topn_cap": "0.15",
+        "topn_cap_low": "0.12",
+        "topn_n": "10",
+        "topn_dyn_q_hi": "0.85",
+        "topn_dyn_q_lo": "0.70",
+        "shock_metric": "p90",
+        "shock_hist_window": "200",
+    }
+
+
 def _policy_args_dyn_cap_2(policy_config: Path, preds_path: Path, out_csv: Path, out_metrics: Path) -> List[str]:
+    p = _policy_params_dyn_cap_2()
     return [
         "scripts/mu_value_weighted_backtest.py",
         "--config",
@@ -129,82 +171,110 @@ def _policy_args_dyn_cap_2(policy_config: Path, preds_path: Path, out_csv: Path,
         "--preds",
         str(preds_path),
         "--h",
-        "24",
+        p["h"],
         "--use_cs",
         "--ret_cs",
         "--disp_metric",
-        "std",
+        p["disp_metric"],
         "--disp_hist_window",
-        "200",
+        p["disp_hist_window"],
         "--disp_scale_q_low",
-        "0.15",
+        p["disp_scale_q_low"],
         "--disp_scale_q_high",
-        "0.40",
+        p["disp_scale_q_high"],
         "--disp_scale_floor",
-        "0.25",
+        p["disp_scale_floor"],
         "--disp_scale_power",
-        "2.0",
+        p["disp_scale_power"],
         "--disagree_q_low",
-        "0.4",
+        p["disagree_q_low"],
         "--disagree_q_high",
-        "0.7",
+        p["disagree_q_high"],
         "--disagree_hist_window",
-        "200",
+        p["disagree_hist_window"],
         "--disagree_scale",
-        "0.3",
+        p["disagree_scale"],
         "--consistency_min",
-        "0.05",
+        p["consistency_min"],
         "--consistency_scale",
-        "0.6",
+        p["consistency_scale"],
         "--gate_combine",
-        "avg",
+        p["gate_combine"],
         "--gate_avg_weights",
-        "0.45,0.35,0.20",
+        p["gate_avg_weights"],
         "--ema_halflife_min",
-        "2",
+        p["ema_halflife_min"],
         "--ema_halflife_max",
-        "8",
+        p["ema_halflife_max"],
         "--ema_disp_lo",
-        "0.02",
+        p["ema_disp_lo"],
         "--ema_disp_hi",
-        "0.10",
+        p["ema_disp_hi"],
         "--min_hold",
-        "2",
+        p["min_hold"],
         "--turnover_budget",
-        "0.15",
+        p["turnover_budget"],
         "--pos_cap",
-        "0.04",
+        p["pos_cap"],
         "--gross_target",
-        "1.0",
+        p["gross_target"],
         "--optimize",
         "--opt_lambda",
-        "1.0",
+        p["opt_lambda"],
         "--opt_kappa",
-        "0.0",
+        p["opt_kappa"],
         "--opt_steps",
-        "20",
+        p["opt_steps"],
         "--opt_risk_window",
-        "240",
+        p["opt_risk_window"],
         "--opt_dollar_neutral",
         "--topn_cap",
-        "0.15",
+        p["topn_cap"],
         "--topn_cap_low",
-        "0.12",
+        p["topn_cap_low"],
         "--topn_n",
-        "10",
+        p["topn_n"],
         "--topn_dyn_q_hi",
-        "0.85",
+        p["topn_dyn_q_hi"],
         "--topn_dyn_q_lo",
-        "0.70",
+        p["topn_dyn_q_lo"],
         "--shock_metric",
-        "p90",
+        p["shock_metric"],
         "--shock_hist_window",
-        "200",
+        p["shock_hist_window"],
         "--out_csv",
         str(out_csv),
         "--out_metrics",
         str(out_metrics),
     ]
+
+
+def _overall_active_coverage(cfg: Dict, horizon: int) -> Dict[str, float]:
+    data = cfg["data"]
+    L = int(data["L"])
+    H = int(data["H"])
+    step = int(data.get("step", H))
+    series = load_panel_npz(str(data["path"]))
+    T = min(len(s.y) for s in series)
+    origin_min = L - 1
+    origin_max = T - H - 1
+    origins = np.arange(origin_min, origin_max + 1, step, dtype=np.int64)
+    counts = np.zeros(origins.shape[0], dtype=np.int64)
+    for s in series:
+        y = s.y
+        if y.ndim == 2:
+            y = y[:, 0]
+        idx = origins + horizon
+        valid = (idx < y.shape[0]) & np.isfinite(y[idx])
+        counts += valid.astype(np.int64)
+    if counts.size == 0:
+        return {"active_mean": float("nan"), "active_p10": float("nan"), "active_median": float("nan"), "active_ge20_ratio": float("nan")}
+    return {
+        "active_mean": float(np.mean(counts)),
+        "active_p10": float(np.percentile(counts, 10)),
+        "active_median": float(np.median(counts)),
+        "active_ge20_ratio": float(np.mean(counts >= 20)),
+    }
 
 
 def _summarize_metrics(path: Path) -> Dict[str, float]:
@@ -364,6 +434,11 @@ def main() -> None:
             n_origins = (origin_max - origin_min) // step + 1
     except Exception as exc:  # noqa: BLE001
         print(f"warning: could not compute valid origin max: {exc}")
+
+    policy_params = _policy_params_dyn_cap_2()
+    print("policy_params:", json.dumps(policy_params, sort_keys=True))
+    overall_cov = _overall_active_coverage(cfg, horizon)
+    print("overall_active_coverage:", json.dumps(overall_cov, sort_keys=True))
 
     folds = _build_folds(n_origins, origin_min, step, args.fold_size, args.n_folds, args.val_size)
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
@@ -556,6 +631,8 @@ def main() -> None:
     wf_summary = {
         "n_folds": len(folds),
         "coverage_warn_folds": int(np.sum([1 for row in summary_rows if row.get("coverage_warn")])),
+        "policy_params": policy_params,
+        "overall_active_coverage": overall_cov,
         "protocol": {
             "purge_len": int(cfg["data"].get("split_purge", 0)),
             "embargo_len": int(cfg["data"].get("split_embargo", 0)),
