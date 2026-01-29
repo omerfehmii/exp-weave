@@ -251,15 +251,19 @@ def _summarize_metrics(path: Path) -> Dict[str, float]:
     }
 
 
-def _ic_count_stats(preds_path: Path, horizon: int) -> Tuple[Optional[float], Optional[float], Optional[float], np.ndarray]:
+def _ic_count_stats(
+    preds_path: Path, horizon: int
+) -> Tuple[Optional[float], Optional[float], Optional[float], np.ndarray]:
     with np.load(preds_path) as d:
         if "mask" not in d or "origin_t" not in d:
             return None, None, None, np.array([], dtype=np.int64)
         mask = d["mask"]
         origin_t = d["origin_t"]
+        q50 = d["q50"] if "q50" in d else None
         if mask.ndim != 2 or horizon < 1 or horizon > mask.shape[1]:
             return None, None, None, np.array([], dtype=np.int64)
-        valid = mask[:, horizon - 1] > 0
+        h_idx = horizon - 1
+        valid = mask[:, h_idx] > 0
         times = origin_t[valid]
         if times.size == 0:
             return None, None, None, np.array([], dtype=np.int64)
@@ -277,6 +281,54 @@ def _ignore_ratio(preds_path: Path) -> Optional[float]:
         if "ignore" in d:
             return float(np.mean(d["ignore"]))
     return None
+
+
+def _coverage_stats(preds_path: Path, horizon: int) -> Dict[str, float]:
+    with np.load(preds_path) as d:
+        if "mask" not in d or "origin_t" not in d or "q50" not in d:
+            return {}
+        mask = d["mask"]
+        origin_t = d["origin_t"]
+        q50 = d["q50"]
+        if mask.ndim != 2 or horizon < 1 or horizon > mask.shape[1]:
+            return {}
+        h_idx = horizon - 1
+        valid = mask[:, h_idx] > 0
+        if not np.any(valid):
+            return {}
+        times = origin_t[valid]
+        # active_count: mask>0 at horizon
+        time_vals, active_counts = np.unique(times, return_counts=True)
+        # ic_count: mask>0 AND finite q50 at horizon
+        if q50.ndim == 2 and q50.shape[1] > h_idx:
+            ic_valid = valid & np.isfinite(q50[:, h_idx])
+        else:
+            ic_valid = valid
+        ic_times = origin_t[ic_valid]
+        if ic_times.size:
+            _, ic_counts = np.unique(ic_times, return_counts=True)
+        else:
+            ic_counts = np.array([], dtype=np.int64)
+        stats = {
+            "active_count_mean": float(np.mean(active_counts)),
+            "active_count_p10": float(np.percentile(active_counts, 10)),
+            "active_count_median": float(np.median(active_counts)),
+            "ic_count_mean": float(np.mean(ic_counts)) if ic_counts.size else float("nan"),
+            "ic_count_p10": float(np.percentile(ic_counts, 10)) if ic_counts.size else float("nan"),
+            "ic_count_median": float(np.median(ic_counts)) if ic_counts.size else float("nan"),
+            "ic_count_ge20_ratio": float(np.mean(ic_counts >= 20)) if ic_counts.size else float("nan"),
+        }
+        # Save time-level coverage for fold
+        cov_rows = []
+        ic_map = {}
+        if ic_counts.size:
+            _, ic_counts_full = np.unique(ic_times, return_counts=True)
+            # align by time_vals order
+            ic_map = {int(t): int(c) for t, c in zip(np.unique(ic_times), ic_counts_full)}
+        for t, a in zip(time_vals, active_counts):
+            cov_rows.append((int(t), int(a), int(ic_map.get(int(t), 0))))
+        stats["_coverage_rows"] = cov_rows
+        return stats
 
 
 def main() -> None:
@@ -323,6 +375,7 @@ def main() -> None:
     combined_metrics_paths: List[Path] = []
     ic_counts_all: List[np.ndarray] = []
     ignore_vals: List[float] = []
+    coverage_all: List[Dict[str, float]] = []
 
     for fold in folds:
         fold_dir = out_dir / f"fold_{fold.fold}"
@@ -345,8 +398,32 @@ def main() -> None:
             "n_origins": n_origins,
             "T_min": T,
         }
+        # Protocol checklist per fold
+        series_list = load_panel_npz(str(cfg["data"]["path"]))
+        ts = series_list[0].timestamps if series_list and series_list[0].timestamps is not None else None
+        protocol = {
+            "fold": fold.fold,
+            "train_range_idx": [0, fold.train_end_idx],
+            "val_range_idx": [fold.train_end_idx + 1, fold.val_end_idx],
+            "test_range_idx": [fold.test_start_idx, fold.test_end_idx],
+            "train_end_t": fold.train_end_t,
+            "val_end_t": fold.val_end_t,
+            "test_end_t": fold.test_end_t,
+            "train_end_ts": str(ts[fold.train_end_t]) if ts is not None else None,
+            "val_end_ts": str(ts[fold.val_end_t]) if ts is not None else None,
+            "test_end_ts": str(ts[fold.test_end_t]) if ts is not None else None,
+            "purge_len": int(cfg["data"].get("split_purge", 0)),
+            "embargo_len": int(cfg["data"].get("split_embargo", 0)),
+            "horizon": horizon,
+            "step": step,
+            "scaler_train_only": True,
+            "decision_time": cfg["data"].get("decision_time", "close"),
+            "feature_lag": int(cfg["data"].get("feature_lag", 0)),
+        }
         with (fold_dir / "meta.json").open("w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
+        with (fold_dir / "protocol.json").open("w", encoding="utf-8") as f:
+            json.dump(protocol, f, indent=2)
 
         preds_paths: List[Path] = []
         for seed in seeds:
@@ -412,6 +489,29 @@ def main() -> None:
         fold_summary["ic_count_mean"] = ic_mean if ic_mean is not None else float("nan")
         fold_summary["ic_count_p10"] = ic_p10 if ic_p10 is not None else float("nan")
         fold_summary["ic_count_ge20_ratio"] = ic_ge20 if ic_ge20 is not None else float("nan")
+        cov = _coverage_stats(ens_path, horizon)
+        if cov:
+            coverage_all.append(cov)
+            fold_summary.update(
+                {
+                    "active_count_mean": cov.get("active_count_mean"),
+                    "active_count_p10": cov.get("active_count_p10"),
+                    "active_count_median": cov.get("active_count_median"),
+                    "ic_count_median": cov.get("ic_count_median"),
+                }
+            )
+            rows = cov.get("_coverage_rows", [])
+            if rows:
+                cov_path = fold_dir / "coverage.csv"
+                with cov_path.open("w", encoding="utf-8") as f:
+                    f.write("time_key,active_count,ic_count\n")
+                    for t, a, ic in rows:
+                        f.write(f"{t},{a},{ic}\n")
+        # Fail-fast warning flag
+        if fold_summary.get("ic_count_ge20_ratio", float("nan")) != fold_summary.get("ic_count_ge20_ratio", 0.0):
+            fold_summary["coverage_warn"] = True
+        else:
+            fold_summary["coverage_warn"] = fold_summary["ic_count_ge20_ratio"] < 0.5
         ignore_ratio = _ignore_ratio(ens_path)
         if ignore_ratio is not None:
             ignore_vals.append(ignore_ratio)
@@ -438,11 +538,45 @@ def main() -> None:
     comb["ic_count_mean"] = float(np.mean(ic_all)) if ic_all.size else float("nan")
     comb["ic_count_p10"] = float(np.percentile(ic_all, 10)) if ic_all.size else float("nan")
     comb["ic_count_ge20_ratio"] = float(np.mean(ic_all >= 20)) if ic_all.size else float("nan")
+    if coverage_all:
+        comb["active_count_mean"] = float(np.mean([c["active_count_mean"] for c in coverage_all if "active_count_mean" in c]))
+        comb["active_count_p10"] = float(np.mean([c["active_count_p10"] for c in coverage_all if "active_count_p10" in c]))
+        comb["active_count_median"] = float(np.mean([c["active_count_median"] for c in coverage_all if "active_count_median" in c]))
+        comb["ic_count_median"] = float(np.mean([c["ic_count_median"] for c in coverage_all if "ic_count_median" in c]))
+    else:
+        comb["active_count_mean"] = float("nan")
+        comb["active_count_p10"] = float("nan")
+        comb["active_count_median"] = float("nan")
+        comb["ic_count_median"] = float("nan")
     comb["ignore_ratio"] = float(np.mean(ignore_vals)) if ignore_vals else float("nan")
     comb["cost_included"] = False
     comb_path = out_dir / "summary_all.json"
     with comb_path.open("w", encoding="utf-8") as f:
         json.dump(comb, f, indent=2)
+    wf_summary = {
+        "n_folds": len(folds),
+        "coverage_warn_folds": int(np.sum([1 for row in summary_rows if row.get("coverage_warn")])),
+        "protocol": {
+            "purge_len": int(cfg["data"].get("split_purge", 0)),
+            "embargo_len": int(cfg["data"].get("split_embargo", 0)),
+            "horizon": horizon,
+            "step": step,
+            "scaler_train_only": True,
+            "decision_time": cfg["data"].get("decision_time", "close"),
+            "feature_lag": int(cfg["data"].get("feature_lag", 0)),
+        },
+        "coverage_summary": {
+            "active_count_mean": comb["active_count_mean"],
+            "active_count_p10": comb["active_count_p10"],
+            "active_count_median": comb["active_count_median"],
+            "ic_count_mean": comb["ic_count_mean"],
+            "ic_count_p10": comb["ic_count_p10"],
+            "ic_count_median": comb["ic_count_median"],
+            "ic_count_ge20_ratio": comb["ic_count_ge20_ratio"],
+        },
+    }
+    with (out_dir / "wf_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(wf_summary, f, indent=2)
 
 
 if __name__ == "__main__":
