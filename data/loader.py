@@ -71,6 +71,14 @@ class WindowedDataset(Dataset):
         y_past = y[past_slice]
         y_future = y[future_slice]
         y_last = y_past[-1]
+        if np.isnan(y_last).any():
+            # Use last finite value in the past window per feature for return targets.
+            y_last = y_last.copy()
+            for d in range(y_past.shape[1]):
+                col = y_past[:, d]
+                idx = np.where(np.isfinite(col))[0]
+                if idx.size:
+                    y_last[d] = col[idx[-1]]
         if np.isnan(y_past).any():
             y_past = np.nan_to_num(y_past, nan=0.0)
         if x_past is None:

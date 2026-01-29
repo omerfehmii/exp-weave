@@ -122,6 +122,11 @@ def main() -> None:
     q50 = preds["q50"]
     q50_std = preds["q50_std"] if "q50_std" in preds else None
     mask = preds["mask"] if "mask" in preds else np.isfinite(y).astype(np.float32)
+    if mask is None:
+        mask = np.isfinite(y).astype(np.float32)
+    elif np.sum(mask) == 0:
+        print("warning: mask is all zeros; treating all entries as valid")
+        mask = np.ones_like(y, dtype=np.float32)
     origin_t = preds["origin_t"].astype(np.int64) if "origin_t" in preds else None
     series_idx = preds["series_idx"].astype(np.int64) if "series_idx" in preds else None
 

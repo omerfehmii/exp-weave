@@ -59,6 +59,37 @@ def _compute_origin_info(cfg: Dict) -> Tuple[int, int, int, int]:
     return T, origin_min, origin_max, n_origins
 
 
+def _compute_valid_origin_max(cfg: Dict, horizon: int) -> int:
+    data = cfg["data"]
+    L = int(data["L"])
+    H = int(data["H"])
+    step = int(data.get("step", H))
+    series = load_panel_npz(str(data["path"]))
+    T = min(len(s.y) for s in series)
+    # Generate all origin candidates.
+    origins = []
+    t = L - 1
+    last = T - H - 1
+    while t <= last:
+        origins.append(t)
+        t += step
+    valid = []
+    for t in origins:
+        any_valid = False
+        for s in series:
+            y = s.y
+            if y.ndim == 1:
+                y = y[:, None]
+            if t + horizon < y.shape[0] and np.isfinite(y[t + horizon]).all():
+                any_valid = True
+                break
+        if any_valid:
+            valid.append(t)
+    if not valid:
+        raise ValueError("No valid origins with observed horizon.")
+    return valid[-1]
+
+
 def _build_folds(n_origins: int, origin_min: int, step: int, fold_size: int, n_folds: int, val_size: int) -> List[FoldSpec]:
     start_test_idx = n_origins - n_folds * fold_size
     if start_test_idx <= val_size:
@@ -240,8 +271,17 @@ def main() -> None:
 
     cfg = _load_cfg(base_cfg_path)
     data = cfg["data"]
+    horizon = int(data["H"])
     step = int(data.get("step", data["H"]))
     T, origin_min, origin_max, n_origins = _compute_origin_info(cfg)
+    # Restrict to origins with observed horizon to avoid empty test windows.
+    try:
+        origin_max_valid = _compute_valid_origin_max(cfg, horizon)
+        if origin_max_valid < origin_max:
+            origin_max = origin_max_valid
+            n_origins = (origin_max - origin_min) // step + 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: could not compute valid origin max: {exc}")
 
     folds = _build_folds(n_origins, origin_min, step, args.fold_size, args.n_folds, args.val_size)
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
@@ -281,8 +321,11 @@ def main() -> None:
             cfg_fold = _load_cfg(base_cfg_path)
             cfg_fold.setdefault("data", {})
             cfg_fold["data"]["split_train_end"] = fold.train_end_t
-            cfg_fold["data"]["split_val_end"] = fold.val_end_t
-            cfg_fold["data"]["split_test_end"] = fold.test_end_t
+            # Extend val/test split ends by horizon so test targets are in-range.
+            cfg_fold["data"]["split_val_end"] = fold.val_end_t + horizon
+            cfg_fold["data"]["split_test_end"] = fold.test_end_t + horizon
+            # Ensure the eval horizon is observed (avoid all-zero mask at h=H).
+            cfg_fold["data"]["min_future_obs"] = horizon
             cfg_fold.setdefault("training", {})
             cfg_fold["training"]["seed"] = seed
             ckpt = fold_dir / "checkpoints" / f"cs_l1_w10_s{seed}.pt"
