@@ -285,9 +285,20 @@ def _overall_active_coverage(cfg: Dict, horizon: int) -> Dict[str, float]:
         y = s.y
         if y.ndim == 2:
             y = y[:, 0]
-        idx = origins + horizon
-        in_range = idx < y.shape[0]
-        valid = in_range & np.isfinite(y[idx])
+        if future_mode == "exact":
+            idx = origins + horizon
+            in_range = idx < y.shape[0]
+            valid = in_range & np.isfinite(y[idx])
+        else:
+            # For nearest/count mode, treat any finite point in the window as available.
+            valid = np.zeros(origins.shape[0], dtype=bool)
+            in_range = np.zeros(origins.shape[0], dtype=bool)
+            for k in range(1, horizon + 1):
+                idx = origins + k
+                in_k = idx < y.shape[0]
+                in_range |= in_k
+                v = in_k & np.isfinite(y[idx])
+                valid |= v
         counts += valid.astype(np.int64)
         total += in_range.astype(np.int64)
     if counts.size == 0:

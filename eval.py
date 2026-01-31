@@ -294,6 +294,8 @@ def filter_indices_by_time_ic(
     indices: List[tuple],
     H: int,
     min_time_ic: int,
+    min_future_obs: int,
+    future_mode: str,
 ) -> List[tuple]:
     if min_time_ic <= 0:
         return indices
@@ -304,7 +306,12 @@ def filter_indices_by_time_ic(
             y = y[:, 0]
         if t + H >= y.shape[0]:
             continue
-        if np.isfinite(y[t + H]):
+        if future_mode == "exact":
+            future_ok = np.isfinite(y[t + H])
+        else:
+            future = y[t + 1 : t + H + 1]
+            future_ok = np.isfinite(future).sum() >= min_future_obs
+        if future_ok:
             counts[t] = counts.get(t, 0) + 1
     keep = [(s_idx, t) for (s_idx, t) in indices if counts.get(t, 0) >= min_time_ic]
     return keep
@@ -678,6 +685,8 @@ def main() -> None:
     min_past_obs = cfg["data"].get("min_past_obs", 1)
     min_future_obs = cfg["data"].get("min_future_obs", 1)
     future_mode = cfg["data"].get("future_obs_mode", "count")
+    if future_mode == "nearest":
+        future_mode = "count"
     min_time_ic = int(cfg["data"].get("min_time_ic_count", 0))
     val_idx = filter_indices_with_observed(
         series_list, val_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs, future_mode
@@ -685,8 +694,12 @@ def main() -> None:
     test_idx = filter_indices_with_observed(
         series_list, test_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs, future_mode
     )
-    val_idx = filter_indices_by_time_ic(series_list, val_idx, cfg["data"]["H"], min_time_ic)
-    test_idx = filter_indices_by_time_ic(series_list, test_idx, cfg["data"]["H"], min_time_ic)
+    val_idx = filter_indices_by_time_ic(
+        series_list, val_idx, cfg["data"]["H"], min_time_ic, min_future_obs, future_mode
+    )
+    test_idx = filter_indices_by_time_ic(
+        series_list, test_idx, cfg["data"]["H"], min_time_ic, min_future_obs, future_mode
+    )
     if regime_enabled and train_idx is not None:
         train_idx = filter_indices_with_observed(
             series_list,
@@ -697,7 +710,9 @@ def main() -> None:
             min_future_obs,
             future_mode,
         )
-        train_idx = filter_indices_by_time_ic(series_list, train_idx, cfg["data"]["H"], min_time_ic)
+        train_idx = filter_indices_by_time_ic(
+            series_list, train_idx, cfg["data"]["H"], min_time_ic, min_future_obs, future_mode
+        )
 
     target_mode = cfg["data"].get("target_mode", "level")
     target_log_eps = float(cfg["data"].get("target_log_eps", 1e-6))
