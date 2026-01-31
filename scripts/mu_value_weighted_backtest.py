@@ -11,7 +11,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from backtest.harness import make_time_splits
-from data.loader import compress_series_observed, load_panel_npz, filter_series_by_active_ratio
+from data.loader import compress_series_observed, load_panel_npz, filter_series_by_active_ratio, filter_series_by_future_ratio
 from eval import apply_scaling
 from utils import load_config
 
@@ -23,8 +23,12 @@ def _load_series(cfg: Dict) -> list:
     min_ratio = float(cfg.get("data", {}).get("universe_min_active_ratio", 0.0))
     min_points = int(cfg.get("data", {}).get("universe_min_active_points", 0))
     active_end = cfg.get("data", {}).get("universe_active_end")
+    min_future_ratio = float(cfg.get("data", {}).get("universe_min_future_ratio", 0.0))
+    future_horizon = int(cfg.get("data", {}).get("H", cfg.get("data", {}).get("future_horizon", 0)))
     if min_ratio or min_points:
         series_list = filter_series_by_active_ratio(series_list, min_ratio, min_points, active_end)
+    if min_future_ratio and future_horizon > 0:
+        series_list = filter_series_by_future_ratio(series_list, min_future_ratio, future_horizon, active_end)
     for s in series_list:
         s.ensure_features()
     return series_list

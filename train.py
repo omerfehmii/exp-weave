@@ -12,7 +12,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 
 from backtest.harness import TimeSplit, generate_panel_origins, make_time_splits, select_indices_by_time
-from data.loader import SeriesData, WindowedDataset, load_panel_npz, compress_series_observed, filter_series_by_active_ratio
+from data.loader import (
+    SeriesData,
+    WindowedDataset,
+    load_panel_npz,
+    compress_series_observed,
+    filter_series_by_active_ratio,
+    filter_series_by_future_ratio,
+)
 from data.features import append_direction_features
 from data.preprocess import FoldFitPreprocessor
 from model import ModelConfig, MultiScaleForecastModel, PatchScale
@@ -230,12 +237,16 @@ def build_series_list(
     min_active_ratio: float = 0.0,
     min_active_points: int = 0,
     active_end: int | None = None,
+    min_future_ratio: float = 0.0,
+    future_horizon: int = 0,
 ) -> List[SeriesData]:
     series_list = load_panel_npz(path)
     if observed_only:
         series_list = compress_series_observed(series_list)
     if min_active_ratio or min_active_points:
         series_list = filter_series_by_active_ratio(series_list, min_active_ratio, min_active_points, active_end)
+    if min_future_ratio and future_horizon > 0:
+        series_list = filter_series_by_future_ratio(series_list, min_future_ratio, future_horizon, active_end)
         if not series_list:
             raise ValueError("Universe filter removed all series. Check universe_min_active_ratio/points.")
     for series in series_list:
@@ -493,6 +504,8 @@ def main() -> None:
         min_active_ratio=float(cfg["data"].get("universe_min_active_ratio", 0.0)),
         min_active_points=int(cfg["data"].get("universe_min_active_points", 0)),
         active_end=cfg["data"].get("universe_active_end"),
+        min_future_ratio=float(cfg["data"].get("universe_min_future_ratio", 0.0)),
+        future_horizon=int(cfg["data"].get("H", cfg["data"].get("future_horizon", 0))),
     )
     lengths = [len(s.y) for s in series_list]
     split_train_end = cfg["data"].get("split_train_end", None)

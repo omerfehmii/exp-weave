@@ -185,6 +185,35 @@ def filter_series_by_active_ratio(
     return filtered
 
 
+def filter_series_by_future_ratio(
+    series_list: List[SeriesData],
+    min_ratio: Optional[float],
+    horizon: int,
+    active_end: Optional[int] = None,
+) -> List[SeriesData]:
+    if not min_ratio or min_ratio <= 0:
+        return series_list
+    filtered: List[SeriesData] = []
+    for series in series_list:
+        y = series.y
+        y2 = y[:, None] if y.ndim == 1 else y
+        mask = series.mask
+        if mask is None:
+            mask = make_observation_mask(y2)
+        if mask.ndim == 1:
+            mask = mask[:, None]
+        end = len(mask) - 1 if active_end is None else max(0, min(int(active_end), len(mask) - 1))
+        if end - horizon <= 0:
+            continue
+        idx = np.arange(0, end - horizon + 1, dtype=np.int64) + horizon
+        valid = mask[idx, 0] > 0
+        ratio = float(np.mean(valid)) if valid.size else 0.0
+        if ratio < float(min_ratio):
+            continue
+        filtered.append(series)
+    return filtered
+
+
 def compress_series_observed(series_list: List[SeriesData]) -> List[SeriesData]:
     compressed: List[SeriesData] = []
     for series in series_list:

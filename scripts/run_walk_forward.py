@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data.loader import load_panel_npz, compress_series_observed, filter_series_by_active_ratio
+from data.loader import load_panel_npz, compress_series_observed, filter_series_by_active_ratio, filter_series_by_future_ratio
 
 
 @dataclass
@@ -50,8 +50,12 @@ def _load_series(cfg: Dict) -> List:
     min_ratio = float(cfg.get("data", {}).get("universe_min_active_ratio", 0.0))
     min_points = int(cfg.get("data", {}).get("universe_min_active_points", 0))
     active_end = cfg.get("data", {}).get("universe_active_end")
+    min_future_ratio = float(cfg.get("data", {}).get("universe_min_future_ratio", 0.0))
+    future_horizon = int(cfg.get("data", {}).get("H", cfg.get("data", {}).get("future_horizon", 0)))
     if min_ratio or min_points:
         series = filter_series_by_active_ratio(series, min_ratio, min_points, active_end)
+    if min_future_ratio and future_horizon > 0:
+        series = filter_series_by_future_ratio(series, min_future_ratio, future_horizon, active_end)
     return series
 
 
@@ -503,6 +507,8 @@ def main() -> None:
         "n_series_filtered": int(len(series_list_for_stats)),
         "min_active_ratio": float(cfg["data"].get("universe_min_active_ratio", 0.0)),
         "min_active_points": int(cfg["data"].get("universe_min_active_points", 0)),
+        "min_future_ratio": float(cfg["data"].get("universe_min_future_ratio", 0.0)),
+        "future_horizon": int(cfg["data"].get("H", cfg["data"].get("future_horizon", 0))),
     }
     obs_interval = _infer_obs_interval(series_list_for_stats)
     base_hours = _infer_freq_hours(cfg["data"].get("freq"))
@@ -564,6 +570,8 @@ def main() -> None:
         # Inherit policy data settings if present.
         cfg_fold["data"]["universe_min_active_ratio"] = cfg["data"].get("universe_min_active_ratio", 0.0)
         cfg_fold["data"]["universe_min_active_points"] = cfg["data"].get("universe_min_active_points", 0)
+        cfg_fold["data"]["universe_min_future_ratio"] = cfg["data"].get("universe_min_future_ratio", 0.0)
+        cfg_fold["data"]["future_horizon"] = horizon
         cfg_fold["data"]["future_obs_mode"] = cfg["data"].get("future_obs_mode", "count")
 
         meta = {
@@ -604,6 +612,8 @@ def main() -> None:
             "future_obs_mode": cfg_fold["data"].get("future_obs_mode", "count"),
             "universe_filter_mode": "fold_train_only",
             "universe_active_end": int(cfg_fold["data"].get("universe_active_end", 0)),
+            "universe_min_future_ratio": float(cfg_fold["data"].get("universe_min_future_ratio", 0.0)),
+            "future_horizon": int(cfg_fold["data"].get("future_horizon", horizon)),
         }
         with (fold_dir / "meta.json").open("w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
@@ -658,6 +668,8 @@ def main() -> None:
             policy_cfg["data"]["universe_active_end"] = fold.train_end_t
             policy_cfg["data"]["universe_min_active_ratio"] = cfg_fold["data"].get("universe_min_active_ratio", 0.0)
             policy_cfg["data"]["universe_min_active_points"] = cfg_fold["data"].get("universe_min_active_points", 0)
+            policy_cfg["data"]["universe_min_future_ratio"] = cfg_fold["data"].get("universe_min_future_ratio", 0.0)
+            policy_cfg["data"]["future_horizon"] = cfg_fold["data"].get("future_horizon", horizon)
             policy_cfg["data"]["future_obs_mode"] = cfg_fold["data"].get("future_obs_mode", "count")
             _save_cfg(policy_cfg, policy_fold_path)
             cmd = [py, *_policy_args_dyn_cap_2(policy_fold_path, ens_path, out_csv, out_metrics)]
