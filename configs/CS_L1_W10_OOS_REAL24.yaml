@@ -21,7 +21,7 @@ data:
   min_future_obs: 24
   future_obs_mode: exact
   universe_min_active_ratio: 0.0
-  universe_min_future_ratio: 0.6
+  universe_min_future_ratio: 0.1
 model:
   d_model: 256
   n_layers: 6
