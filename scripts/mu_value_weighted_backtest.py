@@ -112,6 +112,7 @@ def main() -> None:
     parser.add_argument("--opt_risk_eps", type=float, default=1.0e-6)
     parser.add_argument("--opt_dollar_neutral", action="store_true")
     parser.add_argument("--walk_folds", type=int, default=0)
+    parser.add_argument("--min_ic_count", type=int, default=0)
     parser.add_argument("--out_csv", default=None)
     parser.add_argument("--out_metrics", default=None)
     parser.add_argument("--oos_last_steps", type=int, default=0)
@@ -277,6 +278,8 @@ def main() -> None:
     for t in np.unique(time_key):
         idx = np.where((time_key == t) & valid)[0]
         if idx.size == 0:
+            continue
+        if args.min_ic_count and idx.size < args.min_ic_count:
             continue
         mu_t = mu[idx].astype(np.float64, copy=True)
         ret_t = ret[idx].astype(np.float64, copy=True)

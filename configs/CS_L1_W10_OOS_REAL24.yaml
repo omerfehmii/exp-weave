@@ -19,7 +19,8 @@ data:
   target_log_eps: 1.0e-06
   min_past_obs: 24
   min_future_obs: 24
-  universe_min_active_ratio: 0.9
+  future_obs_mode: exact
+  universe_min_active_ratio: 0.15
 model:
   d_model: 256
   n_layers: 6

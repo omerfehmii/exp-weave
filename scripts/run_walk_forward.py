@@ -170,6 +170,7 @@ def _policy_params_dyn_cap_2() -> Dict[str, str]:
         "topn_dyn_q_lo": "0.70",
         "shock_metric": "p90",
         "shock_hist_window": "200",
+        "min_ic_count": "20",
     }
 
 
@@ -253,6 +254,8 @@ def _policy_args_dyn_cap_2(policy_config: Path, preds_path: Path, out_csv: Path,
         p["shock_metric"],
         "--shock_hist_window",
         p["shock_hist_window"],
+        "--min_ic_count",
+        p["min_ic_count"],
         "--out_csv",
         str(out_csv),
         "--out_metrics",
@@ -498,6 +501,7 @@ def main() -> None:
         "origin_stride_hours": float(step * base_hours) if base_hours else None,
         "observed_only": observed_only,
         "time_axis_mode": "compressed" if observed_only else "original",
+        "future_obs_mode": cfg["data"].get("future_obs_mode", "count"),
     }
     if obs_interval:
         time_units.update(obs_interval)

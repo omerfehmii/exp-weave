@@ -373,6 +373,7 @@ def filter_indices_with_observed(
     H: int,
     min_past_obs: int,
     min_future_obs: int,
+    future_mode: str = "count",
 ) -> List[tuple]:
     if min_past_obs <= 0 and min_future_obs <= 0:
         return indices
@@ -382,8 +383,14 @@ def filter_indices_with_observed(
         if y.ndim == 1:
             y = y[:, None]
         past = y[t - L + 1 : t + 1]
-        future = y[t + 1 : t + H + 1]
-        if np.isfinite(past).sum() >= min_past_obs and np.isfinite(future).sum() >= min_future_obs:
+        if future_mode == "exact":
+            if t + H >= y.shape[0]:
+                continue
+            future_ok = np.isfinite(y[t + H]).all()
+        else:
+            future = y[t + 1 : t + H + 1]
+            future_ok = np.isfinite(future).sum() >= min_future_obs
+        if np.isfinite(past).sum() >= min_past_obs and future_ok:
             keep.append((s_idx, t))
     return keep
 
@@ -527,8 +534,13 @@ def main() -> None:
     )
     min_past_obs = cfg["data"].get("min_past_obs", 1)
     min_future_obs = cfg["data"].get("min_future_obs", 1)
-    train_idx = filter_indices_with_observed(series_list, train_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs)
-    val_idx = filter_indices_with_observed(series_list, val_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs)
+    future_mode = cfg["data"].get("future_obs_mode", "count")
+    train_idx = filter_indices_with_observed(
+        series_list, train_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs, future_mode
+    )
+    val_idx = filter_indices_with_observed(
+        series_list, val_idx, cfg["data"]["L"], cfg["data"]["H"], min_past_obs, min_future_obs, future_mode
+    )
     if not train_idx:
         raise RuntimeError("No training samples after filtering. Check min_past_obs/min_future_obs.")
     if not val_idx:
