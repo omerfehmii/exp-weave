@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+import shutil
 
 import numpy as np
 import yaml
@@ -137,9 +138,9 @@ def _build_folds(n_origins: int, origin_min: int, step: int, fold_size: int, n_f
     return folds
 
 
-def _policy_params_dyn_cap_2() -> Dict[str, str]:
+def _policy_params_dyn_cap_2(horizon: int) -> Dict[str, str]:
     return {
-        "h": "24",
+        "h": str(int(horizon)),
         "disp_metric": "std",
         "disp_hist_window": "200",
         "disp_scale_q_low": "0.15",
@@ -179,8 +180,10 @@ def _policy_params_dyn_cap_2() -> Dict[str, str]:
     }
 
 
-def _policy_args_dyn_cap_2(policy_config: Path, preds_path: Path, out_csv: Path, out_metrics: Path) -> List[str]:
-    p = _policy_params_dyn_cap_2()
+def _policy_args_dyn_cap_2(
+    policy_config: Path, preds_path: Path, out_csv: Path, out_metrics: Path, horizon: int
+) -> List[str]:
+    p = _policy_params_dyn_cap_2(horizon)
     return [
         "scripts/mu_value_weighted_backtest.py",
         "--config",
@@ -546,7 +549,7 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"warning: could not compute valid origin max: {exc}")
 
-    policy_params = _policy_params_dyn_cap_2()
+    policy_params = _policy_params_dyn_cap_2(horizon)
     print("policy_params:", json.dumps(policy_params, sort_keys=True))
     overall_cov = _overall_active_coverage(cfg, horizon)
     print("overall_active_coverage:", json.dumps(overall_cov, sort_keys=True))
@@ -589,6 +592,8 @@ def main() -> None:
     py = str(Path.cwd() / ".venv" / "bin" / "python")
     if not Path(py).exists():
         py = "python"
+    if py == "python" and shutil.which("python") is None and shutil.which("python3") is not None:
+        py = "python3"
 
     summary_rows: List[Dict] = []
     combined_metrics_paths: List[Path] = []
@@ -721,10 +726,12 @@ def main() -> None:
             policy_cfg["data"]["universe_min_active_ratio"] = cfg_fold["data"].get("universe_min_active_ratio", 0.0)
             policy_cfg["data"]["universe_min_active_points"] = cfg_fold["data"].get("universe_min_active_points", 0)
             policy_cfg["data"]["universe_min_future_ratio"] = cfg_fold["data"].get("universe_min_future_ratio", 0.0)
+            policy_cfg["data"]["H"] = horizon
+            policy_cfg["data"]["step"] = horizon
             policy_cfg["data"]["future_horizon"] = cfg_fold["data"].get("future_horizon", horizon)
             policy_cfg["data"]["future_obs_mode"] = cfg_fold["data"].get("future_obs_mode", "count")
             _save_cfg(policy_cfg, policy_fold_path)
-            cmd = [py, *_policy_args_dyn_cap_2(policy_fold_path, ens_path, out_csv, out_metrics)]
+            cmd = [py, *_policy_args_dyn_cap_2(policy_fold_path, ens_path, out_csv, out_metrics, horizon)]
             subprocess.run(cmd, check=True)
 
         fold_summary = _summarize_metrics(out_metrics)
