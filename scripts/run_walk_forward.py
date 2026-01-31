@@ -428,7 +428,7 @@ def _ignore_ratio(preds_path: Path) -> Optional[float]:
     return None
 
 
-def _coverage_stats(preds_path: Path, horizon: int) -> Dict[str, float]:
+def _coverage_stats(preds_path: Path, horizon: int, cfg: Optional[Dict] = None) -> Dict[str, float]:
     with np.load(preds_path) as d:
         if "mask" not in d or "origin_t" not in d or "q50" not in d:
             return {}
@@ -473,6 +473,42 @@ def _coverage_stats(preds_path: Path, horizon: int) -> Dict[str, float]:
         for t, a in zip(time_vals, active_counts):
             cov_rows.append((int(t), int(a), int(ic_map.get(int(t), 0))))
         stats["_coverage_rows"] = cov_rows
+
+        # Nearest gap stats (if indices are available and cfg provided)
+        if cfg is not None and "series_idx" in d and "origin_t" in d:
+            series_idx = d["series_idx"].astype(np.int64)
+            origin_t_full = d["origin_t"].astype(np.int64)
+            series = _load_series(cfg)
+            base_hours = _infer_freq_hours(cfg["data"].get("data_freq")) or 1.0
+            gaps = []
+            for s_idx, t in zip(series_idx, origin_t_full):
+                if s_idx >= len(series):
+                    continue
+                y = series[s_idx].y
+                if y.ndim == 2:
+                    y = y[:, 0]
+                if t + horizon >= y.shape[0]:
+                    continue
+                k = None
+                for step_k in range(1, horizon + 1):
+                    if t + step_k < y.shape[0] and np.isfinite(y[t + step_k]):
+                        k = step_k
+                        break
+                if k is None:
+                    continue
+                ts = series[s_idx].timestamps
+                if ts is not None and t + k < len(ts):
+                    try:
+                        delta = (ts[t + k] - ts[t]).astype("timedelta64[h]")
+                        gaps.append(float(delta))
+                        continue
+                    except Exception:
+                        pass
+                gaps.append(float(k) * base_hours)
+            if gaps:
+                stats["nearest_gap_p50"] = float(np.percentile(gaps, 50))
+                stats["nearest_gap_p90"] = float(np.percentile(gaps, 90))
+                stats["nearest_gap_mean"] = float(np.mean(gaps))
         return stats
 
 
@@ -662,6 +698,8 @@ def main() -> None:
                         "test",
                         "--out_npz",
                         str(preds_path),
+                        "--save_indices",
+                        "true",
                     ],
                     check=True,
                 )
@@ -696,7 +734,7 @@ def main() -> None:
         fold_summary["ic_count_mean"] = ic_mean if ic_mean is not None else float("nan")
         fold_summary["ic_count_p10"] = ic_p10 if ic_p10 is not None else float("nan")
         fold_summary["ic_count_ge20_ratio"] = ic_ge20 if ic_ge20 is not None else float("nan")
-        cov = _coverage_stats(ens_path, horizon)
+        cov = _coverage_stats(ens_path, horizon, cfg_fold)
         if cov:
             coverage_all.append(cov)
             fold_summary.update(
