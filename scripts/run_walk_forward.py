@@ -300,11 +300,14 @@ def _overall_active_coverage(cfg: Dict, horizon: int) -> Dict[str, float]:
             "future_obs_mode": future_mode,
         }
     missing_ratio = float(1.0 - np.sum(counts) / np.maximum(np.sum(total), 1.0))
+    min_time_ic = int(cfg["data"].get("min_time_ic_count", 0))
+    time_ge_ratio = float(np.mean(counts >= min_time_ic)) if min_time_ic > 0 else float("nan")
     return {
         "active_mean": float(np.mean(counts)),
         "active_p10": float(np.percentile(counts, 10)),
         "active_median": float(np.median(counts)),
         "active_ge20_ratio": float(np.mean(counts >= 20)),
+        "time_ge_min_ic_ratio": time_ge_ratio,
         "exact_missing_ratio": missing_ratio,
         "future_obs_mode": future_mode,
     }
