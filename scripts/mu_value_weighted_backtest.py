@@ -22,8 +22,9 @@ def _load_series(cfg: Dict) -> list:
         series_list = compress_series_observed(series_list)
     min_ratio = float(cfg.get("data", {}).get("universe_min_active_ratio", 0.0))
     min_points = int(cfg.get("data", {}).get("universe_min_active_points", 0))
+    active_end = cfg.get("data", {}).get("universe_active_end")
     if min_ratio or min_points:
-        series_list = filter_series_by_active_ratio(series_list, min_ratio, min_points)
+        series_list = filter_series_by_active_ratio(series_list, min_ratio, min_points, active_end)
     for s in series_list:
         s.ensure_features()
     return series_list
@@ -275,12 +276,16 @@ def main() -> None:
     topn_cap_used = []
     topn_riskoff = False
     pca_exposure_abs = []
+    total_times = 0
+    used_times = 0
     for t in np.unique(time_key):
         idx = np.where((time_key == t) & valid)[0]
         if idx.size == 0:
             continue
+        total_times += 1
         if args.min_ic_count and idx.size < args.min_ic_count:
             continue
+        used_times += 1
         mu_t = mu[idx].astype(np.float64, copy=True)
         ret_t = ret[idx].astype(np.float64, copy=True)
         ret_t_raw = ret_t.copy()
@@ -613,12 +618,15 @@ def main() -> None:
                 f"pca_exposure_abs_mean={float(np.mean(exp_arr)):.6f} "
                 f"pca_exposure_abs_p90={float(np.percentile(exp_arr, 90)):.6f}"
             )
-        if topn_cap_used:
-            cap_arr = np.asarray(topn_cap_used, dtype=np.float64)
-            print(
-                f"topn_cap_used_mean={float(np.mean(cap_arr)):.3f} "
-                f"topn_riskoff_frac={float(np.mean(cap_arr <= args.topn_cap_low)):.3f}"
-            )
+    if topn_cap_used:
+        cap_arr = np.asarray(topn_cap_used, dtype=np.float64)
+        print(
+            f"topn_cap_used_mean={float(np.mean(cap_arr)):.3f} "
+            f"topn_riskoff_frac={float(np.mean(cap_arr <= args.topn_cap_low)):.3f}"
+        )
+    if total_times:
+        dropped = total_times - used_times
+        print(f"min_ic_count_drop={dropped} used_times={used_times} total_times={total_times}")
     if turnover_time:
         avg_turnover = float(np.mean(turnover_time))
         print(f"turnover_mean={avg_turnover:.6f}")

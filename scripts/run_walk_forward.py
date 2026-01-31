@@ -49,8 +49,9 @@ def _load_series(cfg: Dict) -> List:
         series = compress_series_observed(series)
     min_ratio = float(cfg.get("data", {}).get("universe_min_active_ratio", 0.0))
     min_points = int(cfg.get("data", {}).get("universe_min_active_points", 0))
+    active_end = cfg.get("data", {}).get("universe_active_end")
     if min_ratio or min_points:
-        series = filter_series_by_active_ratio(series, min_ratio, min_points)
+        series = filter_series_by_active_ratio(series, min_ratio, min_points, active_end)
     return series
 
 
@@ -268,26 +269,40 @@ def _overall_active_coverage(cfg: Dict, horizon: int) -> Dict[str, float]:
     L = int(data["L"])
     H = int(data["H"])
     step = int(data.get("step", H))
+    future_mode = cfg["data"].get("future_obs_mode", "count")
     series = _load_series(cfg)
     T = min(len(s.y) for s in series)
     origin_min = L - 1
     origin_max = T - H - 1
     origins = np.arange(origin_min, origin_max + 1, step, dtype=np.int64)
     counts = np.zeros(origins.shape[0], dtype=np.int64)
+    total = np.zeros(origins.shape[0], dtype=np.int64)
     for s in series:
         y = s.y
         if y.ndim == 2:
             y = y[:, 0]
         idx = origins + horizon
-        valid = (idx < y.shape[0]) & np.isfinite(y[idx])
+        in_range = idx < y.shape[0]
+        valid = in_range & np.isfinite(y[idx])
         counts += valid.astype(np.int64)
+        total += in_range.astype(np.int64)
     if counts.size == 0:
-        return {"active_mean": float("nan"), "active_p10": float("nan"), "active_median": float("nan"), "active_ge20_ratio": float("nan")}
+        return {
+            "active_mean": float("nan"),
+            "active_p10": float("nan"),
+            "active_median": float("nan"),
+            "active_ge20_ratio": float("nan"),
+            "exact_missing_ratio": float("nan"),
+            "future_obs_mode": future_mode,
+        }
+    missing_ratio = float(1.0 - np.sum(counts) / np.maximum(np.sum(total), 1.0))
     return {
         "active_mean": float(np.mean(counts)),
         "active_p10": float(np.percentile(counts, 10)),
         "active_median": float(np.median(counts)),
         "active_ge20_ratio": float(np.mean(counts >= 20)),
+        "exact_missing_ratio": missing_ratio,
+        "future_obs_mode": future_mode,
     }
 
 
@@ -506,6 +521,7 @@ def main() -> None:
     if obs_interval:
         time_units.update(obs_interval)
     print("time_units:", json.dumps(time_units, sort_keys=True))
+    universe_filter["mode"] = "fold_train_only"
     print("universe_filter:", json.dumps(universe_filter, sort_keys=True))
     if base_hours and step > 1 and horizon > 1:
         print("warning: step>1 and H>1; verify horizon units vs sampling interval")
@@ -531,6 +547,25 @@ def main() -> None:
         (fold_dir / "preds").mkdir(parents=True, exist_ok=True)
         (fold_dir / "logs").mkdir(parents=True, exist_ok=True)
 
+        cfg_fold = _load_cfg(base_cfg_path)
+        cfg_fold.setdefault("data", {})
+        cfg_fold["data"]["split_train_end"] = fold.train_end_t
+        # Extend val/test split ends by horizon so test targets are in-range.
+        cfg_fold["data"]["split_val_end"] = fold.val_end_t + horizon
+        cfg_fold["data"]["split_test_end"] = fold.test_end_t + horizon
+        # Ensure the eval horizon is observed (avoid all-zero mask at h=H).
+        cfg_fold["data"]["min_future_obs"] = horizon
+        if args.min_future_obs is not None:
+            cfg_fold["data"]["min_future_obs"] = int(args.min_future_obs)
+        if args.min_past_obs is not None:
+            cfg_fold["data"]["min_past_obs"] = int(args.min_past_obs)
+        # Fold-specific universe based on train window only.
+        cfg_fold["data"]["universe_active_end"] = fold.train_end_t
+        # Inherit policy data settings if present.
+        cfg_fold["data"]["universe_min_active_ratio"] = cfg["data"].get("universe_min_active_ratio", 0.0)
+        cfg_fold["data"]["universe_min_active_points"] = cfg["data"].get("universe_min_active_points", 0)
+        cfg_fold["data"]["future_obs_mode"] = cfg["data"].get("future_obs_mode", "count")
+
         meta = {
             "fold": fold.fold,
             "train_end_t": fold.train_end_t,
@@ -546,7 +581,7 @@ def main() -> None:
             "T_min": T,
         }
         # Protocol checklist per fold
-        series_list = load_panel_npz(str(cfg["data"]["path"]))
+        series_list = _load_series(cfg_fold)
         ts = series_list[0].timestamps if series_list and series_list[0].timestamps is not None else None
         protocol = {
             "fold": fold.fold,
@@ -559,13 +594,16 @@ def main() -> None:
             "train_end_ts": str(ts[fold.train_end_t]) if ts is not None else None,
             "val_end_ts": str(ts[fold.val_end_t]) if ts is not None else None,
             "test_end_ts": str(ts[fold.test_end_t]) if ts is not None else None,
-            "purge_len": int(cfg["data"].get("split_purge", 0)),
-            "embargo_len": int(cfg["data"].get("split_embargo", 0)),
+            "purge_len": int(cfg_fold["data"].get("split_purge", 0)),
+            "embargo_len": int(cfg_fold["data"].get("split_embargo", 0)),
             "horizon": horizon,
             "step": step,
             "scaler_train_only": True,
-            "decision_time": cfg["data"].get("decision_time", "close"),
-            "feature_lag": int(cfg["data"].get("feature_lag", 0)),
+            "decision_time": cfg_fold["data"].get("decision_time", "close"),
+            "feature_lag": int(cfg_fold["data"].get("feature_lag", 0)),
+            "future_obs_mode": cfg_fold["data"].get("future_obs_mode", "count"),
+            "universe_filter_mode": "fold_train_only",
+            "universe_active_end": int(cfg_fold["data"].get("universe_active_end", 0)),
         }
         with (fold_dir / "meta.json").open("w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
@@ -574,18 +612,6 @@ def main() -> None:
 
         preds_paths: List[Path] = []
         for seed in seeds:
-            cfg_fold = _load_cfg(base_cfg_path)
-            cfg_fold.setdefault("data", {})
-            cfg_fold["data"]["split_train_end"] = fold.train_end_t
-            # Extend val/test split ends by horizon so test targets are in-range.
-            cfg_fold["data"]["split_val_end"] = fold.val_end_t + horizon
-            cfg_fold["data"]["split_test_end"] = fold.test_end_t + horizon
-            # Ensure the eval horizon is observed (avoid all-zero mask at h=H).
-            cfg_fold["data"]["min_future_obs"] = horizon
-            if args.min_future_obs is not None:
-                cfg_fold["data"]["min_future_obs"] = int(args.min_future_obs)
-            if args.min_past_obs is not None:
-                cfg_fold["data"]["min_past_obs"] = int(args.min_past_obs)
             cfg_fold.setdefault("training", {})
             cfg_fold["training"]["seed"] = seed
             ckpt = fold_dir / "checkpoints" / f"cs_l1_w10_s{seed}.pt"
@@ -626,7 +652,15 @@ def main() -> None:
         if not (args.skip_existing and out_metrics.exists()):
             if args.policy_preset.lower() != "dyncap2":
                 raise ValueError("Only policy_preset=dynCap2 is supported right now.")
-            cmd = [py, *_policy_args_dyn_cap_2(policy_cfg_path, ens_path, out_csv, out_metrics)]
+            policy_fold_path = fold_dir / "configs" / "policy.yaml"
+            policy_cfg = _load_cfg(policy_cfg_path)
+            policy_cfg.setdefault("data", {})
+            policy_cfg["data"]["universe_active_end"] = fold.train_end_t
+            policy_cfg["data"]["universe_min_active_ratio"] = cfg_fold["data"].get("universe_min_active_ratio", 0.0)
+            policy_cfg["data"]["universe_min_active_points"] = cfg_fold["data"].get("universe_min_active_points", 0)
+            policy_cfg["data"]["future_obs_mode"] = cfg_fold["data"].get("future_obs_mode", "count")
+            _save_cfg(policy_cfg, policy_fold_path)
+            cmd = [py, *_policy_args_dyn_cap_2(policy_fold_path, ens_path, out_csv, out_metrics)]
             subprocess.run(cmd, check=True)
 
         fold_summary = _summarize_metrics(out_metrics)

@@ -229,12 +229,13 @@ def build_series_list(
     observed_only: bool = False,
     min_active_ratio: float = 0.0,
     min_active_points: int = 0,
+    active_end: int | None = None,
 ) -> List[SeriesData]:
     series_list = load_panel_npz(path)
     if observed_only:
         series_list = compress_series_observed(series_list)
     if min_active_ratio or min_active_points:
-        series_list = filter_series_by_active_ratio(series_list, min_active_ratio, min_active_points)
+        series_list = filter_series_by_active_ratio(series_list, min_active_ratio, min_active_points, active_end)
         if not series_list:
             raise ValueError("Universe filter removed all series. Check universe_min_active_ratio/points.")
     for series in series_list:
@@ -491,6 +492,7 @@ def main() -> None:
         observed_only=cfg["data"].get("observed_only", False),
         min_active_ratio=float(cfg["data"].get("universe_min_active_ratio", 0.0)),
         min_active_points=int(cfg["data"].get("universe_min_active_points", 0)),
+        active_end=cfg["data"].get("universe_active_end"),
     )
     lengths = [len(s.y) for s in series_list]
     split_train_end = cfg["data"].get("split_train_end", None)

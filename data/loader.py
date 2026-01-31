@@ -157,6 +157,7 @@ def filter_series_by_active_ratio(
     series_list: List[SeriesData],
     min_ratio: Optional[float] = None,
     min_points: Optional[int] = None,
+    active_end: Optional[int] = None,
 ) -> List[SeriesData]:
     if not min_ratio and not min_points:
         return series_list
@@ -169,7 +170,11 @@ def filter_series_by_active_ratio(
             mask = make_observation_mask(y2)
         if mask.ndim == 1:
             mask = mask[:, None]
-        active = mask[:, 0] > 0
+        if active_end is not None:
+            end = max(0, min(int(active_end) + 1, mask.shape[0]))
+            active = mask[:end, 0] > 0
+        else:
+            active = mask[:, 0] > 0
         active_count = int(np.sum(active))
         active_ratio = active_count / float(len(active)) if len(active) else 0.0
         if min_ratio and active_ratio < float(min_ratio):
