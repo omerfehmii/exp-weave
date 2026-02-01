@@ -321,13 +321,22 @@ def _fit_gbdt(
             random_state=seed,
             n_jobs=-1,
         )
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-            early_stopping_rounds=50,
-        )
+        try:
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                verbose=False,
+                early_stopping_rounds=50,
+            )
+        except TypeError:
+            # Older xgboost may not support early_stopping_rounds in sklearn API.
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                verbose=False,
+            )
         return model, "xgboost"
     except Exception as exc:
         raise RuntimeError("Neither lightgbm nor xgboost is available.") from exc
