@@ -686,13 +686,14 @@ def main() -> None:
         out_path = Path(args.out_metrics)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w", encoding="utf-8") as f:
-            f.write("pnl,hhi,top10,gross,vol_mkt\n")
+            f.write("pnl,hhi,top10,gross,vol_mkt,turnover\n")
             for i, v in enumerate(pnl_time):
                 h = hhi_time[i] if i < len(hhi_time) else float("nan")
                 t = top10_time[i] if i < len(top10_time) else float("nan")
                 g = gross_time[i] if i < len(gross_time) else float("nan")
                 vm = vol_mkt_time[i] if i < len(vol_mkt_time) else float("nan")
-                f.write(f"{v:.8f},{h:.8f},{t:.8f},{g:.8f},{vm:.8f}\n")
+                to = turnover_time[i] if i < len(turnover_time) else float("nan")
+                f.write(f"{v:.8f},{h:.8f},{t:.8f},{g:.8f},{vm:.8f},{to:.8f}\n")
 
 
 def _load_score_map(path: Path) -> tuple[np.ndarray, np.ndarray]:

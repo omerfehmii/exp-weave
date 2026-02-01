@@ -387,7 +387,7 @@ def _summarize_metrics(path: Path) -> Dict[str, float]:
     s = np.sort(pnl)[::-1]
     top5 = float(s[:5].sum()) if len(s) >= 5 else float(s.sum())
     total = float(pnl.sum())
-    return {
+    summary = {
         "n": int(len(pnl)),
         "mean": mean,
         "std": std,
@@ -397,6 +397,11 @@ def _summarize_metrics(path: Path) -> Dict[str, float]:
         "top5_sum": top5,
         "top5_over_total": top5 / total if total != 0 else float("nan"),
     }
+    # Dominance proxy: top5 pnl share (same as top5_over_total).
+    summary["dominance"] = summary["top5_over_total"]
+    if "turnover" in df.columns:
+        summary["turnover_mean"] = float(np.nanmean(df["turnover"].to_numpy()))
+    return summary
 
 
 def _ic_count_stats(
