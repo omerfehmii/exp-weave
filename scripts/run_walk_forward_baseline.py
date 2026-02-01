@@ -124,7 +124,10 @@ def _extract_sample(
     else:
         target_arr = y_future
 
-    return feat, target_arr.astype(np.float32)
+    target_arr = target_arr.astype(np.float32)
+    if target_arr.ndim == 2 and target_arr.shape[1] == 1:
+        target_arr = target_arr[:, 0]
+    return feat, target_arr
 
 
 def _build_matrix(
